@@ -1,0 +1,16 @@
+[workspace]
+members = ["auxein-core", "auxein"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+authors = ["Dimitri Avenel"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

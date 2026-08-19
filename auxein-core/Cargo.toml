@@ -1,0 +1,11 @@
+[package]
+name = "auxein-core"
+description = "Minimal std-only Auxein v0.2.0 engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
