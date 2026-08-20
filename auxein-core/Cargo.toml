@@ -1,6 +1,6 @@
 [package]
 name = "auxein-core"
-description = "Minimal std-only Auxein v0.2.0 engine"
+description = "Minimal std-only Auxein v0.3.0 engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

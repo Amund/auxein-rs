@@ -12,4 +12,4 @@ name = "auxein"
 path = "src/main.rs"
 
 [dependencies]
-auxein-core = { version = "0.2.0", path = "../auxein-core" }
+auxein-core = { version = "0.3.0", path = "../auxein-core" }

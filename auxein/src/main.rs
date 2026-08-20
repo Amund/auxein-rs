@@ -6,7 +6,7 @@ use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 use auxein_core::{
-    parse_presentation_json, step_report_json, summary_json, Budget, Error, Network, Result,
+    parse_presentation_json, step_report_json, summary_json, Budget, Error, Mode, Network, Result,
 };
 
 fn main() -> ExitCode {
@@ -44,6 +44,7 @@ struct Opts {
     memory: Option<f64>,
     eta: Option<f64>,
     scalar: Option<String>,
+    mode: Option<Mode>,
     universe: Option<String>,
     budget: Option<Budget>,
     load: Option<String>,
@@ -62,8 +63,8 @@ fn parse_opts(args: &[String], allow_save: bool) -> Result<Opts> {
                 i += 1;
                 continue;
             }
-            "--dimension" | "--memory" | "--eta" | "--scalar" | "--universe" | "--budget"
-            | "--budget-units" | "--load" | "--save" => {}
+            "--dimension" | "--memory" | "--eta" | "--scalar" | "--mode" | "--universe"
+            | "--budget" | "--budget-units" | "--load" | "--save" => {}
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -99,6 +100,7 @@ fn parse_opts(args: &[String], allow_save: bool) -> Result<Opts> {
                 );
             }
             "--scalar" => out.scalar = Some(value.clone()),
+            "--mode" => out.mode = Some(Mode::parse(value)?),
             "--universe" => out.universe = Some(value.clone()),
             "--budget" => set_budget_once(&mut out.budget, Budget::kernels(value))?,
             "--budget-units" => {
@@ -132,9 +134,13 @@ fn build_network(opts: &Opts) -> Result<Network> {
     })?;
     let universe = opts.universe.clone().unwrap_or_else(|| "auxein".into());
     if let Some(path) = &opts.load {
-        if opts.dimension.is_some() || opts.memory.is_some() || opts.scalar.is_some() {
+        if opts.dimension.is_some()
+            || opts.memory.is_some()
+            || opts.scalar.is_some()
+            || opts.mode.is_some()
+        {
             return Err(Error::Invalid(
-                "--dimension, --memory and --scalar come from the loaded state".into(),
+                "--dimension, --memory, --scalar and --mode come from the loaded state".into(),
             ));
         }
         let text =
@@ -153,7 +159,8 @@ fn build_network(opts: &Opts) -> Result<Network> {
             .ok_or_else(|| Error::Invalid("--memory is required for a new state".into()))?;
         let scalar = opts.scalar.as_deref().unwrap_or("f64");
         let eta = opts.eta.unwrap_or(1.0);
-        Network::new(scalar, dimension, memory, eta, budget, universe)
+        let mode = opts.mode.unwrap_or(Mode::Geometry);
+        Network::new_with_mode(scalar, dimension, memory, eta, mode, budget, universe)
     }
 }
 
@@ -212,10 +219,12 @@ fn print_help() {
            --memory T          EMA half-life for a new state\n\
            --eta R             learning multiplier in [0,1] (default 1)\n\
            --scalar f32|f64    persistent scalar (default f64)\n\
+           --mode geometry|temporal\n\
+                              engine mode for a new state (default geometry)\n\
            --budget B          exact-decimal ergonomic kernel capacity\n\
            --budget-units N    exact raw material budget\n\
            --universe NAME     external readout universe (default auxein)\n\
-           --load FILE         load canonical format_version=2 JSON state\n\
+           --load FILE         load canonical format_version=3 JSON state\n\
            --save FILE         atomically save final canonical JSON state\n\
            --detailed          include LayerReport diagnostics\n",
         version = env!("CARGO_PKG_VERSION")
