@@ -4,7 +4,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 fn layer_json(mode: &str, cells: String, temporal_cells: String) -> String {
-    if mode == "temporal" {
+    if mode != "geometry" {
         format!(
             "{{\"sigma\":[],\"cells\":[{cells}],\"temporal_sigma\":[],\"temporal_cells\":[{temporal_cells}],\"previous\":null}}"
         )
@@ -14,15 +14,18 @@ fn layer_json(mode: &str, cells: String, temporal_cells: String) -> String {
 }
 
 fn state_json(scenario: &str, d: usize, cells: usize, mode: &str) -> String {
-    assert!(matches!(mode, "geometry" | "temporal"));
+    assert!(matches!(mode, "geometry" | "temporal" | "predictive"));
     let layers = match scenario {
-        "singleton" | "temporal-stable" => {
+        "singleton" | "temporal-stable" | "predictive-stable" => {
             if scenario == "temporal-stable" && mode != "temporal" {
                 panic!("temporal-stable requires temporal mode");
             }
+            if scenario == "predictive-stable" && mode != "predictive" {
+                panic!("predictive-stable requires predictive mode");
+            }
             let mut c = vec![0.0; d];
             c[0] = 2.0;
-            let temporal = if scenario == "temporal-stable" {
+            let temporal = if matches!(scenario, "temporal-stable" | "predictive-stable") {
                 let mut tc = c.clone();
                 tc.extend_from_slice(&c);
                 kernel(1.0, &tc, 0.5)
@@ -82,7 +85,7 @@ fn state_json(scenario: &str, d: usize, cells: usize, mode: &str) -> String {
         _ => panic!("unknown scenario"),
     };
     format!(
-        "{{\"format_version\":3,\"dimension\":{d},\"scalar\":\"f64\",\"memory\":50.0,\"eta\":0.0,\"mode\":\"{mode}\",\"steps_seen\":0,\"layers\":[{layers}]}}"
+        "{{\"format_version\":4,\"dimension\":{d},\"scalar\":\"f64\",\"memory\":50.0,\"eta\":0.0,\"mode\":\"{mode}\",\"steps_seen\":0,\"layers\":[{layers}]}}"
     )
 }
 
@@ -97,7 +100,7 @@ fn kernel(w: f64, c: &[f64], v: f64) -> String {
 
 fn presentation(scenario: &str, d: usize, cells: usize) -> Vec<Vec<f64>> {
     match scenario {
-        "singleton" | "temporal-stable" => {
+        "singleton" | "temporal-stable" | "predictive-stable" => {
             let mut x = vec![0.0; d];
             x[0] = 2.0;
             vec![x]
@@ -151,7 +154,7 @@ fn main() {
     }
     let secs = t.elapsed().as_secs_f64();
     println!(
-        "{{\"canon\":\"0.3.0\",\"mode\":\"{mode}\",\"scenario\":\"{scenario}\",\"dimension\":{d},\"cells\":{cells},\"steps\":{steps},\"seconds\":{secs},\"microseconds_per_step\":{},\"steps_per_second\":{}}}",
+        "{{\"canon\":\"0.4.0\",\"mode\":\"{mode}\",\"scenario\":\"{scenario}\",\"dimension\":{d},\"cells\":{cells},\"steps\":{steps},\"seconds\":{secs},\"microseconds_per_step\":{},\"steps_per_second\":{}}}",
         secs * 1e6 / steps as f64,
         steps as f64 / secs
     );

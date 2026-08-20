@@ -219,12 +219,12 @@ fn print_help() {
            --memory T          EMA half-life for a new state\n\
            --eta R             learning multiplier in [0,1] (default 1)\n\
            --scalar f32|f64    persistent scalar (default f64)\n\
-           --mode geometry|temporal\n\
+           --mode geometry|temporal|predictive\n\
                               engine mode for a new state (default geometry)\n\
            --budget B          exact-decimal ergonomic kernel capacity\n\
            --budget-units N    exact raw material budget\n\
            --universe NAME     external readout universe (default auxein)\n\
-           --load FILE         load canonical format_version=3 JSON state\n\
+           --load FILE         load canonical format_version=4 JSON state\n\
            --save FILE         atomically save final canonical JSON state\n\
            --detailed          include LayerReport diagnostics\n",
         version = env!("CARGO_PKG_VERSION")

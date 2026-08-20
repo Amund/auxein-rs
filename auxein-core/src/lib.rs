@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Auxein v0.3.0 production core.
+//! Auxein v0.4.0 production core.
 //!
 //! The crate is deliberately dependency-free. Persistent geometry is stored
 //! in the selected scalar (`f32` or `f64`), every cognitive calculation is
@@ -18,7 +18,7 @@ use std::sync::{
     Arc,
 };
 
-pub const FORMAT_VERSION: u64 = 3;
+pub const FORMAT_VERSION: u64 = 4;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -26,6 +26,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Mode {
     Geometry,
     Temporal,
+    Predictive,
 }
 
 impl Mode {
@@ -33,8 +34,9 @@ impl Mode {
         match value {
             "geometry" => Ok(Self::Geometry),
             "temporal" => Ok(Self::Temporal),
+            "predictive" => Ok(Self::Predictive),
             _ => Err(Error::Invalid(
-                "mode must be 'geometry' or 'temporal'".into(),
+                "mode must be 'geometry', 'temporal' or 'predictive'".into(),
             )),
         }
     }
@@ -43,11 +45,16 @@ impl Mode {
         match self {
             Self::Geometry => "geometry",
             Self::Temporal => "temporal",
+            Self::Predictive => "predictive",
         }
     }
 
     pub const fn temporal(self) -> bool {
-        matches!(self, Self::Temporal)
+        matches!(self, Self::Temporal | Self::Predictive)
+    }
+
+    pub const fn predictive(self) -> bool {
+        matches!(self, Self::Predictive)
     }
 }
 
@@ -413,11 +420,24 @@ pub struct TemporalRecognition {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Prediction {
+    pub universe: Arc<str>,
+    pub current_context: Vec<f64>,
+    pub recognised_source: Vec<f64>,
+    pub predicted_successor: Vec<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Readout {
     Geometry(Vec<Recognition>),
     Temporal {
         concepts: Vec<Recognition>,
         sequences: Vec<TemporalRecognition>,
+    },
+    Predictive {
+        concepts: Vec<Recognition>,
+        sequences: Vec<TemporalRecognition>,
+        predictions: Vec<Prediction>,
     },
 }
 
@@ -425,19 +445,26 @@ impl Readout {
     pub fn concepts(&self) -> &[Recognition] {
         match self {
             Self::Geometry(values) => values,
-            Self::Temporal { concepts, .. } => concepts,
+            Self::Temporal { concepts, .. } | Self::Predictive { concepts, .. } => concepts,
         }
     }
 
     pub fn sequences(&self) -> &[TemporalRecognition] {
         match self {
             Self::Geometry(_) => &[],
-            Self::Temporal { sequences, .. } => sequences,
+            Self::Temporal { sequences, .. } | Self::Predictive { sequences, .. } => sequences,
+        }
+    }
+
+    pub fn predictions(&self) -> &[Prediction] {
+        match self {
+            Self::Predictive { predictions, .. } => predictions,
+            Self::Geometry(_) | Self::Temporal { .. } => &[],
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.concepts().is_empty() && self.sequences().is_empty()
+        self.concepts().is_empty() && self.sequences().is_empty() && self.predictions().is_empty()
     }
 
     /// Number of conceptual recognitions. Geometry-mode callers can keep the
@@ -1135,7 +1162,7 @@ impl<S: Scalar> Auxein<S> {
     pub fn layer_units(&self) -> Result<u64> {
         match self.mode {
             Mode::Geometry => Ok(16),
-            Mode::Temporal => 33u64
+            Mode::Temporal | Mode::Predictive => 33u64
                 .checked_add(self.kernel_units()?)
                 .ok_or_else(|| Error::Invalid("material accounting overflow".into())),
         }
@@ -1261,6 +1288,7 @@ impl<S: Scalar> Auxein<S> {
         let mut concept_readout = Vec::new();
         let mut readout_layers = 0usize;
         let mut sequence_readout = Vec::new();
+        let mut prediction_readout = Vec::new();
         let mut all_seed_requests: Vec<(Space, usize, Kernel64)> = Vec::new();
         let mut layer_reports = Vec::new();
         let mut temporal_reports = Vec::new();
@@ -1308,6 +1336,29 @@ impl<S: Scalar> Auxein<S> {
                         variance: kernel.variance.to_f64(),
                     });
                 let context = context_slot.as_ref();
+
+                // Prediction reads only temporal CELLs that already existed
+                // before this layer's temporal learning phase. It projects
+                // source/target centers and never reconstructs endpoint variance.
+                if self.mode.predictive() {
+                    if let Some(context) = context {
+                        for cell in &self.layers[layer_index].temporal_cells {
+                            debug_assert_eq!(cell.center.len(), self.dimension * 2);
+                            let source = &cell.center[..self.dimension];
+                            if point_concern_scalar(&context.center, source) {
+                                prediction_readout.push(Prediction {
+                                    universe: self.universe.clone(),
+                                    current_context: context.center.clone(),
+                                    recognised_source: scalar_vec_to_f64(source),
+                                    predicted_successor: scalar_vec_to_f64(
+                                        &cell.center[self.dimension..],
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+
                 if let (Some(previous), Some(context)) = (previous.as_ref(), context) {
                     let atom = self.temporal_atom(previous, context);
                     let result = self.process_temporal(layer_index, &[atom], detailed_report)?;
@@ -1494,11 +1545,17 @@ impl<S: Scalar> Auxein<S> {
             sort_dedup_recognitions(&mut concept_readout);
         }
         sort_dedup_temporal_recognitions(&mut sequence_readout);
+        sort_dedup_predictions(&mut prediction_readout);
         let readout = match self.mode {
             Mode::Geometry => Readout::Geometry(concept_readout),
             Mode::Temporal => Readout::Temporal {
                 concepts: concept_readout,
                 sequences: sequence_readout,
+            },
+            Mode::Predictive => Readout::Predictive {
+                concepts: concept_readout,
+                sequences: sequence_readout,
+                predictions: prediction_readout,
             },
         };
         Ok(StepReport {
@@ -2288,7 +2345,7 @@ impl<S: Scalar> Auxein<S> {
     pub fn export_json(&self) -> String {
         let mut out = String::with_capacity(256 + self.maintenance_units().unwrap_or(0) as usize);
         out.push('{');
-        out.push_str("\"format_version\":3,");
+        out.push_str("\"format_version\":4,");
         out.push_str("\"dimension\":");
         out.push_str(&self.dimension.to_string());
         out.push_str(",\"scalar\":");
@@ -2664,7 +2721,7 @@ impl ParsedState {
                 Mode::Geometry => {
                     exact_keys(&layer, &["sigma", "cells"], &format!("state.layers[{li}]"))?
                 }
-                Mode::Temporal => exact_keys(
+                Mode::Temporal | Mode::Predictive => exact_keys(
                     &layer,
                     &[
                         "sigma",
@@ -2688,7 +2745,7 @@ impl ParsedState {
             )?;
             let (temporal_sigma, temporal_cells, previous) = match mode {
                 Mode::Geometry => (Vec::new(), Vec::new(), None),
-                Mode::Temporal => {
+                Mode::Temporal | Mode::Predictive => {
                     let temporal_sigma = parse_kernel_list(
                         take_array(&mut layer, "temporal_sigma", "temporal_sigma")?,
                         2 * dimension,
@@ -2888,6 +2945,50 @@ fn first_coordinate_candidate_range<S: Scalar>(
         end += 1;
     }
     start..end
+}
+
+fn point_concern_scalar<S: Scalar>(current: &[f64], source: &[S]) -> bool {
+    debug_assert_eq!(current.len(), source.len());
+    let current2 = norm2(current);
+    let source2 = norm2_scalar(source);
+    let current_nonzero = current.iter().any(|&x| x != 0.0);
+    let source_nonzero = source.iter().any(|&x| x.to_f64() != 0.0);
+    let extreme = !current2.is_finite()
+        || !source2.is_finite()
+        || (current2 == 0.0 && current_nonzero)
+        || (source2 == 0.0 && source_nonzero);
+
+    if extreme {
+        let mut scale = 0.0f64;
+        for &x in current {
+            scale = scale.max(x.abs());
+        }
+        for &x in source {
+            scale = scale.max(x.to_f64().abs());
+        }
+        if scale == 0.0 {
+            return false;
+        }
+        let current_scaled = stable_sum(current.iter().map(|&x| {
+            let y = x / scale;
+            y * y
+        }));
+        let source_scaled = stable_sum(source.iter().map(|&x| {
+            let y = x.to_f64() / scale;
+            y * y
+        }));
+        let distance_scaled = stable_sum(current.iter().zip(source).map(|(&a, &b)| {
+            let d = a / scale - b.to_f64() / scale;
+            d * d
+        }));
+        return distance_scaled < current_scaled && distance_scaled < source_scaled;
+    }
+
+    let distance2 = stable_sum(current.iter().zip(source).map(|(&a, &b)| {
+        let d = a - b.to_f64();
+        d * d
+    }));
+    distance2 < current2 && distance2 < source2
 }
 
 fn concern_scalar<S: Scalar>(
@@ -3428,6 +3529,24 @@ fn sort_dedup_temporal_recognitions(readout: &mut Vec<TemporalRecognition>) {
     });
 }
 
+fn prediction_cmp(a: &Prediction, b: &Prediction) -> Ordering {
+    a.universe
+        .cmp(&b.universe)
+        .then_with(|| cmp_vec(&a.current_context, &b.current_context))
+        .then_with(|| cmp_vec(&a.recognised_source, &b.recognised_source))
+        .then_with(|| cmp_vec(&a.predicted_successor, &b.predicted_successor))
+}
+
+fn sort_dedup_predictions(readout: &mut Vec<Prediction>) {
+    readout.sort_by(prediction_cmp);
+    readout.dedup_by(|a, b| {
+        a.universe == b.universe
+            && a.current_context == b.current_context
+            && a.recognised_source == b.recognised_source
+            && a.predicted_successor == b.predicted_successor
+    });
+}
+
 fn ratio_string(numerator: u64, denominator: u64) -> Result<String> {
     if denominator == 0 {
         return Err(Error::Invalid("zero budget unit".into()));
@@ -3600,6 +3719,25 @@ pub fn parse_presentation_json(text: &str) -> Result<Vec<Vec<f64>>> {
     Ok(out)
 }
 
+fn write_temporal_recognition_items(out: &mut String, sequences: &[TemporalRecognition]) {
+    for (i, rec) in sequences.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('[');
+        json::quote(out, &rec.universe);
+        out.push_str(",[");
+        write_f64_vec(out, rec.previous_input.as_ref());
+        out.push(',');
+        write_f64_vec(out, rec.current_input.as_ref());
+        out.push_str("],[");
+        write_f64_vec(out, &rec.previous_recognised);
+        out.push(',');
+        write_f64_vec(out, &rec.current_recognised);
+        out.push_str("]]");
+    }
+}
+
 pub fn step_report_json(report: &StepReport) -> String {
     let mut out = String::with_capacity(768);
     out.push('{');
@@ -3615,21 +3753,32 @@ pub fn step_report_json(report: &StepReport) -> String {
             out.push_str("{\"concepts\":");
             write_recognition_list(&mut out, concepts);
             out.push_str(",\"sequences\":[");
-            for (i, rec) in sequences.iter().enumerate() {
+            write_temporal_recognition_items(&mut out, sequences);
+            out.push_str("]}");
+        }
+        Readout::Predictive {
+            concepts,
+            sequences,
+            predictions,
+        } => {
+            out.push_str("{\"concepts\":");
+            write_recognition_list(&mut out, concepts);
+            out.push_str(",\"sequences\":[");
+            write_temporal_recognition_items(&mut out, sequences);
+            out.push_str("],\"predictions\":[");
+            for (i, prediction) in predictions.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
                 out.push('[');
-                json::quote(&mut out, &rec.universe);
-                out.push_str(",[");
-                write_f64_vec(&mut out, rec.previous_input.as_ref());
+                json::quote(&mut out, &prediction.universe);
                 out.push(',');
-                write_f64_vec(&mut out, rec.current_input.as_ref());
-                out.push_str("],[");
-                write_f64_vec(&mut out, &rec.previous_recognised);
+                write_f64_vec(&mut out, &prediction.current_context);
                 out.push(',');
-                write_f64_vec(&mut out, &rec.current_recognised);
-                out.push_str("]]");
+                write_f64_vec(&mut out, &prediction.recognised_source);
+                out.push(',');
+                write_f64_vec(&mut out, &prediction.predicted_successor);
+                out.push(']');
             }
             out.push_str("]}");
         }
@@ -3912,6 +4061,18 @@ mod tests {
         .unwrap()
     }
 
+    fn make_predictive64() -> Auxein<f64> {
+        Auxein::new_with_mode(
+            1,
+            10.0,
+            1.0,
+            Mode::Predictive,
+            Budget::kernels("100"),
+            "auxein",
+        )
+        .unwrap()
+    }
+
     #[test]
     fn packing() {
         let n = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("0"), "auxein").unwrap();
@@ -4030,7 +4191,7 @@ mod tests {
 
     #[test]
     fn f32_projected_seed_is_revalidated_before_persistence() {
-        let state = r#"{"format_version":3,"dimension":2,"scalar":"f32","memory":1.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0,1.0],"V":0.0}]}]}"#;
+        let state = r#"{"format_version":4,"dimension":2,"scalar":"f32","memory":1.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0,1.0],"V":0.0}]}]}"#;
         let mut n = Auxein::<f32>::from_json(state, Budget::kernels("100"), "projection").unwrap();
 
         // In binary64 this point is just outside the strict first CONCERN
@@ -4099,7 +4260,7 @@ mod tests {
 
     #[test]
     fn context_frontier_is_in_growth_transaction() {
-        let state = r#"{"format_version":3,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
+        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
         let mut roomy = Auxein::<f64>::from_json(state, Budget::kernels("100"), "auxein").unwrap();
         let report = roomy.step(&[vec![1.0], vec![3.0]], true).unwrap();
         assert!(report.layer_reports[0].context_emitted);
@@ -4115,7 +4276,7 @@ mod tests {
 
     #[test]
     fn multiwinner_allocation_is_conservative() {
-        let state = r#"{"format_version":3,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":3.0,"C":[2.0],"V":10.0}]}]}"#;
+        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":3.0,"C":[2.0],"V":10.0}]}]}"#;
         let mut n = Auxein::<f64>::from_json(state, Budget::kernels("100"), "auxein").unwrap();
         let report = n.step(&[vec![3.0]], true).unwrap();
         let masses = &report.layer_reports[0].cell_responsibility_mass;
@@ -4201,7 +4362,7 @@ mod tests {
 
     #[test]
     fn strict_state_rejects_unrepresentable_f32_config() {
-        let bad = r#"{"format_version":3,"dimension":1,"scalar":"f32","memory":10.1,"eta":0.7,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[]}]}"#;
+        let bad = r#"{"format_version":4,"dimension":1,"scalar":"f32","memory":10.1,"eta":0.7,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[]}]}"#;
         assert!(Auxein::<f32>::from_json(bad, Budget::kernels("10"), "x").is_err());
     }
     #[test]
@@ -4337,8 +4498,8 @@ mod tests {
 
     #[test]
     fn context_geometry_ignores_learning_responsibility() {
-        let state_a = r#"{"format_version":3,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":1.0,"C":[2.0],"V":10.0}]}]}"#;
-        let state_b = r#"{"format_version":3,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":100.0,"C":[2.0],"V":10.0}]}]}"#;
+        let state_a = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":1.0,"C":[2.0],"V":10.0}]}]}"#;
+        let state_b = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":100.0,"C":[2.0],"V":10.0}]}]}"#;
         let mut a = Auxein::<f64>::from_json(state_a, Budget::kernels("100"), "auxein").unwrap();
         let mut b = Auxein::<f64>::from_json(state_b, Budget::kernels("100"), "auxein").unwrap();
         let ra = a.step(&[vec![3.0]], true).unwrap();
@@ -4365,7 +4526,7 @@ mod tests {
 
     #[test]
     fn context_mass_is_recognised_input_mass_without_duplication() {
-        let state = r#"{"format_version":3,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
+        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
         let mut n = Auxein::<f64>::from_json(state, Budget::kernels("100"), "auxein").unwrap();
         let r = n.step(&[vec![1.0], vec![3.0], vec![-10.0]], true).unwrap();
         let layer = &r.layer_reports[0];
@@ -4374,7 +4535,7 @@ mod tests {
         assert_eq!(layer.context_center, Some(vec![2.0]));
         assert_eq!(layer.context_variance, Some(1.0));
 
-        let state = r#"{"format_version":3,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":1.0,"C":[2.0],"V":10.0}]}]}"#;
+        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":1.0,"C":[2.0],"V":10.0}]}]}"#;
         let mut n = Auxein::<f64>::from_json(state, Budget::kernels("100"), "auxein").unwrap();
         let r = n.step(&[vec![3.0]], true).unwrap();
         let layer = &r.layer_reports[0];
@@ -4385,14 +4546,14 @@ mod tests {
 
     #[test]
     fn singleton_and_zero_center_contexts_are_vertical_silence() {
-        let singleton = r#"{"format_version":3,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[2.0],"V":0.0}]}]}"#;
+        let singleton = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[2.0],"V":0.0}]}]}"#;
         let mut n = Auxein::<f64>::from_json(singleton, Budget::kernels("100"), "auxein").unwrap();
         let r = n.step(&[vec![2.0]], true).unwrap();
         assert_eq!(r.layer_reports[0].context_center, Some(vec![2.0]));
         assert_eq!(r.layer_reports[0].context_variance, Some(0.0));
         assert!(!r.layer_reports[0].context_emitted);
 
-        let symmetric = r#"{"format_version":3,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[-1.0],"V":0.0},{"W":1.0,"C":[1.0],"V":0.0}]}]}"#;
+        let symmetric = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[-1.0],"V":0.0},{"W":1.0,"C":[1.0],"V":0.0}]}]}"#;
         let mut n = Auxein::<f64>::from_json(symmetric, Budget::kernels("100"), "auxein").unwrap();
         let r = n.step(&[vec![-1.0], vec![1.0]], true).unwrap();
         assert_eq!(r.layer_reports[0].context_center, Some(vec![0.0]));
@@ -4402,7 +4563,7 @@ mod tests {
 
     #[test]
     fn perfect_pair_emits_one_context_and_stops_after_l1_learns_it() {
-        let state = r#"{"format_version":3,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
+        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
         let mut n = Auxein::<f64>::from_json(state, Budget::kernels("1000"), "auxein").unwrap();
         let first = n.step(&[vec![1.0], vec![3.0]], true).unwrap();
         assert_eq!(first.layer_reports[0].context_center, Some(vec![2.0]));
@@ -4419,7 +4580,7 @@ mod tests {
 
     #[test]
     fn constant_input_with_two_explanations_does_not_build_deep_cascade() {
-        let state = r#"{"format_version":3,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":1.0},{"W":1.0,"C":[2.0],"V":1.0}]}]}"#;
+        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":1.0},{"W":1.0,"C":[2.0],"V":1.0}]}]}"#;
         let mut n = Auxein::<f64>::from_json(state, Budget::kernels("1000"), "auxein").unwrap();
         for _ in 0..40 {
             n.step(&[vec![1.5]], false).unwrap();
@@ -4435,7 +4596,7 @@ mod tests {
         fn run<S: Scalar>() {
             let scalar = S::NAME;
             let state = format!(
-                "{{\"format_version\":3,\"dimension\":1,\"scalar\":\"{scalar}\",\"memory\":23.0,\"eta\":1.0,\"mode\":\"geometry\",\"steps_seen\":0,\"layers\":[{{\"sigma\":[],\"cells\":[{{\"W\":1.0,\"C\":[-3.0],\"V\":0.25}},{{\"W\":2.0,\"C\":[1.0],\"V\":0.25}},{{\"W\":3.0,\"C\":[4.0],\"V\":0.25}}]}}]}}"
+                "{{\"format_version\":4,\"dimension\":1,\"scalar\":\"{scalar}\",\"memory\":23.0,\"eta\":1.0,\"mode\":\"geometry\",\"steps_seen\":0,\"layers\":[{{\"sigma\":[],\"cells\":[{{\"W\":1.0,\"C\":[-3.0],\"V\":0.25}},{{\"W\":2.0,\"C\":[1.0],\"V\":0.25}},{{\"W\":3.0,\"C\":[4.0],\"V\":0.25}}]}}]}}"
             );
             let mut lazy = Auxein::<S>::from_json(&state, Budget::kernels("100"), "u").unwrap();
             let mut eager = lazy.clone();
@@ -4478,7 +4639,7 @@ mod tests {
 
     #[test]
     fn lazy_decay_clock_is_clone_local() {
-        let state = r#"{"format_version":3,"dimension":1,"scalar":"f64","memory":31.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[-3.0],"V":0.25},{"W":2.0,"C":[1.0],"V":0.25},{"W":3.0,"C":[4.0],"V":0.25}]}]}"#;
+        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":31.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[-3.0],"V":0.25},{"W":2.0,"C":[1.0],"V":0.25},{"W":3.0,"C":[4.0],"V":0.25}]}]}"#;
         let mut original = Auxein::<f64>::from_json(state, Budget::kernels("100"), "u").unwrap();
         for _ in 0..80 {
             original.step(&[vec![1.0]], false).unwrap();
@@ -4516,7 +4677,211 @@ mod tests {
         assert!(n.export_json().contains("\"mode\":\"geometry\""));
         assert_eq!(Mode::parse("geometry").unwrap(), Mode::Geometry);
         assert_eq!(Mode::parse("temporal").unwrap(), Mode::Temporal);
-        assert!(Mode::parse("predictive").is_err());
+        assert_eq!(Mode::parse("predictive").unwrap(), Mode::Predictive);
+        assert!(Mode::parse("future").is_err());
+    }
+
+    #[test]
+    fn predictive_projects_existing_temporal_cell_from_current_context() {
+        let mut n = Auxein::<f64>::new_with_mode(
+            1,
+            10.0,
+            0.0,
+            Mode::Predictive,
+            Budget::kernels("100"),
+            "lab",
+        )
+        .unwrap();
+        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
+        // Full temporal variance is deliberately huge: prediction projects only
+        // the source/target centers and cannot reconstruct endpoint variance.
+        n.layers[0].temporal_cells = vec![Kernel::new(7.0, &[1.0, 5.0], 123.0).unwrap()];
+
+        let report = n.step(&[vec![1.0]], false).unwrap();
+        assert_eq!(report.readout.concepts().len(), 1);
+        assert!(report.readout.sequences().is_empty());
+        assert_eq!(report.readout.predictions().len(), 1);
+        let prediction = &report.readout.predictions()[0];
+        assert_eq!(prediction.universe.as_ref(), "lab");
+        assert_eq!(prediction.current_context, vec![1.0]);
+        assert_eq!(prediction.recognised_source, vec![1.0]);
+        assert_eq!(prediction.predicted_successor, vec![5.0]);
+    }
+
+    #[test]
+    fn predictive_branching_emits_every_known_successor_without_selection() {
+        let mut n = make_predictive64();
+        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
+        n.layers[0].temporal_cells = vec![
+            Kernel::new(1.0, &[1.0, 3.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[1.0, 5.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[3.0, 9.0], 0.0).unwrap(), // must not chain 1->3->9
+        ];
+
+        let report = n.step(&[vec![1.0]], false).unwrap();
+        let successors: Vec<Vec<f64>> = report
+            .readout
+            .predictions()
+            .iter()
+            .map(|p| p.predicted_successor.clone())
+            .collect();
+        assert_eq!(successors, vec![vec![3.0], vec![5.0]]);
+    }
+
+    #[test]
+    fn predictive_zero_source_is_silent_and_zero_target_is_explicit() {
+        let mut n = make_predictive64();
+        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
+        n.layers[0].temporal_cells = vec![
+            Kernel::new(1.0, &[0.0, 9.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[1.0, 0.0], 0.0).unwrap(),
+        ];
+
+        let report = n.step(&[vec![1.0]], false).unwrap();
+        assert_eq!(report.readout.predictions().len(), 1);
+        assert_eq!(report.readout.predictions()[0].recognised_source, vec![1.0]);
+        assert_eq!(
+            report.readout.predictions()[0].predicted_successor,
+            vec![0.0]
+        );
+    }
+
+    #[test]
+    fn newly_promoted_temporal_cell_predicts_only_from_next_step() {
+        let mut n = make_predictive64();
+        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
+
+        let first = n.step(&[vec![1.0]], false).unwrap();
+        assert!(first.readout.predictions().is_empty());
+        let second = n.step(&[vec![1.0]], false).unwrap();
+        assert!(second.readout.predictions().is_empty());
+        assert_eq!(n.layers[0].temporal_sigma.len(), 1);
+        let third = n.step(&[vec![1.0]], false).unwrap();
+        assert!(third.readout.predictions().is_empty());
+        assert_eq!(n.layers[0].temporal_cells.len(), 1);
+        let fourth = n.step(&[vec![1.0]], false).unwrap();
+        assert_eq!(fourth.readout.predictions().len(), 1);
+        assert_eq!(
+            fourth.readout.predictions()[0].predicted_successor,
+            vec![1.0]
+        );
+    }
+
+    #[test]
+    fn predictive_and_temporal_have_identical_persistent_trajectory_and_cost() {
+        let mut temporal = make_temporal64();
+        let mut predictive = make_predictive64();
+        let stream = [1.0, 3.0, 1.0, 3.0, 9.0, 1.0, 3.0, 1.0, 3.0];
+
+        assert_eq!(
+            temporal.maintenance_units().unwrap(),
+            predictive.maintenance_units().unwrap()
+        );
+        for x in stream {
+            temporal.step(&[vec![x]], false).unwrap();
+            predictive.step(&[vec![x]], false).unwrap();
+            assert_eq!(temporal.layers, predictive.layers);
+            assert_eq!(temporal.steps_seen, predictive.steps_seen);
+            assert_eq!(
+                temporal.maintenance_units().unwrap(),
+                predictive.maintenance_units().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn predictive_scale_and_signed_orthogonal_invariance() {
+        fn build(
+            current: &[f64],
+            source: &[f64],
+            target: &[f64],
+            temporal_variance: f64,
+        ) -> Auxein<f64> {
+            let mut n = Auxein::<f64>::new_with_mode(
+                2,
+                10.0,
+                0.0,
+                Mode::Predictive,
+                Budget::kernels("100"),
+                "u",
+            )
+            .unwrap();
+            n.layers[0].cells = vec![Kernel::new(1.0, current, 0.0).unwrap()];
+            let mut temporal = source.to_vec();
+            temporal.extend_from_slice(target);
+            n.layers[0].temporal_cells =
+                vec![Kernel::new(1.0, &temporal, temporal_variance).unwrap()];
+            n
+        }
+
+        let mut base = build(&[1.0, 0.0], &[0.9, 0.1], &[0.0, 2.0], 77.0);
+        let base_report = base.step(&[vec![1.0, 0.0]], false).unwrap();
+        let p = &base_report.readout.predictions()[0];
+
+        let mut scaled = build(&[10.0, 0.0], &[9.0, 1.0], &[0.0, 20.0], 7700.0);
+        let scaled_report = scaled.step(&[vec![10.0, 0.0]], false).unwrap();
+        let ps = &scaled_report.readout.predictions()[0];
+        assert_eq!(ps.universe, p.universe);
+        assert_eq!(
+            ps.current_context,
+            p.current_context
+                .iter()
+                .map(|x| 10.0 * x)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ps.recognised_source,
+            p.recognised_source
+                .iter()
+                .map(|x| 10.0 * x)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ps.predicted_successor,
+            p.predicted_successor
+                .iter()
+                .map(|x| 10.0 * x)
+                .collect::<Vec<_>>()
+        );
+
+        // Q(x,y)=(-y,x), a signed orthogonal permutation.
+        let mut rotated = build(&[0.0, 1.0], &[-0.1, 0.9], &[-2.0, 0.0], 77.0);
+        let rotated_report = rotated.step(&[vec![0.0, 1.0]], false).unwrap();
+        let pr = &rotated_report.readout.predictions()[0];
+        let q = |v: &[f64]| vec![-v[1], v[0]];
+        assert_eq!(pr.universe, p.universe);
+        assert_eq!(pr.current_context, q(&p.current_context));
+        assert_eq!(pr.recognised_source, q(&p.recognised_source));
+        assert_eq!(pr.predicted_successor, q(&p.predicted_successor));
+    }
+
+    #[test]
+    fn predictive_roundtrip_preserves_mode_state_and_readout() {
+        let mut n = Auxein::<f64>::new_with_mode(
+            1,
+            10.0,
+            0.0,
+            Mode::Predictive,
+            Budget::kernels("100"),
+            "roundtrip",
+        )
+        .unwrap();
+        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
+        n.layers[0].temporal_cells = vec![Kernel::new(1.0, &[1.0, 5.0], 0.0).unwrap()];
+        let state = n.export_json();
+        assert!(state.contains("\"format_version\":4"));
+        assert!(state.contains("\"mode\":\"predictive\""));
+
+        let mut restored =
+            Auxein::<f64>::from_json(&state, Budget::units(n.budget_units()), "roundtrip").unwrap();
+        assert_eq!(restored.mode(), Mode::Predictive);
+        assert_eq!(restored.export_json(), state);
+        let report = restored.step(&[vec![1.0]], false).unwrap();
+        assert_eq!(report.readout.predictions().len(), 1);
+        assert_eq!(
+            report.readout.predictions()[0].predicted_successor,
+            vec![5.0]
+        );
     }
 
     #[test]
