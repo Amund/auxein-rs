@@ -1,12 +1,13 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::fs;
-use std::io::{self, BufRead, Write};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufWriter, Write};
 use std::process::ExitCode;
 
 use auxein_core::{
-    parse_presentation_json, step_report_json, summary_json, Budget, Error, Mode, Network, Result,
+    parse_presentation_json, parse_weighted_presentation_json, summary_json,
+    write_step_report_json, Budget, Error, Mode, Network, Result,
 };
 
 fn main() -> ExitCode {
@@ -45,11 +46,11 @@ struct Opts {
     eta: Option<f64>,
     scalar: Option<String>,
     mode: Option<Mode>,
-    universe: Option<String>,
     budget: Option<Budget>,
     load: Option<String>,
     save: Option<String>,
     detailed: bool,
+    sequence: bool,
 }
 
 fn parse_opts(args: &[String], allow_save: bool) -> Result<Opts> {
@@ -63,8 +64,13 @@ fn parse_opts(args: &[String], allow_save: bool) -> Result<Opts> {
                 i += 1;
                 continue;
             }
-            "--dimension" | "--memory" | "--eta" | "--scalar" | "--mode" | "--universe"
-            | "--budget" | "--budget-units" | "--load" | "--save" => {}
+            "--sequence" => {
+                out.sequence = true;
+                i += 1;
+                continue;
+            }
+            "--dimension" | "--memory" | "--eta" | "--scalar" | "--mode" | "--budget"
+            | "--budget-units" | "--load" | "--save" => {}
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -101,7 +107,6 @@ fn parse_opts(args: &[String], allow_save: bool) -> Result<Opts> {
             }
             "--scalar" => out.scalar = Some(value.clone()),
             "--mode" => out.mode = Some(Mode::parse(value)?),
-            "--universe" => out.universe = Some(value.clone()),
             "--budget" => set_budget_once(&mut out.budget, Budget::kernels(value))?,
             "--budget-units" => {
                 let units: u64 = value.parse().map_err(|_| {
@@ -111,7 +116,7 @@ fn parse_opts(args: &[String], allow_save: bool) -> Result<Opts> {
             }
             "--load" => out.load = Some(value.clone()),
             "--save" => out.save = Some(value.clone()),
-            _ => unreachable!(),
+            _ => return Err(Error::Invalid(format!("unsupported option '{key}'"))),
         }
         i += 2;
     }
@@ -132,7 +137,6 @@ fn build_network(opts: &Opts) -> Result<Network> {
     let budget = opts.budget.clone().ok_or_else(|| {
         Error::Invalid("provide exactly one of --budget or --budget-units".into())
     })?;
-    let universe = opts.universe.clone().unwrap_or_else(|| "auxein".into());
     if let Some(path) = &opts.load {
         if opts.dimension.is_some()
             || opts.memory.is_some()
@@ -145,7 +149,7 @@ fn build_network(opts: &Opts) -> Result<Network> {
         }
         let text =
             fs::read_to_string(path).map_err(|e| Error::Io(format!("cannot read {path}: {e}")))?;
-        let mut network = Network::from_json(&text, budget, universe)?;
+        let mut network = Network::from_json(&text, budget)?;
         if let Some(eta) = opts.eta {
             network.set_eta(eta)?;
         }
@@ -160,31 +164,80 @@ fn build_network(opts: &Opts) -> Result<Network> {
         let scalar = opts.scalar.as_deref().unwrap_or("f64");
         let eta = opts.eta.unwrap_or(1.0);
         let mode = opts.mode.unwrap_or(Mode::Geometry);
-        Network::new_with_mode(scalar, dimension, memory, eta, mode, budget, universe)
+        Network::new_with_mode(scalar, dimension, memory, eta, mode, budget)
     }
 }
 
 fn run_stream(args: &[String]) -> Result<()> {
     let opts = parse_opts(args, true)?;
     let mut network = build_network(&opts)?;
+    if opts.sequence {
+        network.begin_sequence(false)?;
+    }
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
+    let mut failure: Option<Error> = None;
     for (line_no, line) in stdin.lock().lines().enumerate() {
-        let line = line.map_err(|e| Error::Io(format!("stdin: {e}")))?;
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                failure = Some(Error::Io(format!("stdin: {e}")));
+                break;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let presentation = parse_presentation_json(&line)
-            .map_err(|e| Error::Invalid(format!("stdin line {}: {e}", line_no + 1)))?;
-        let report = network.step(&presentation, opts.detailed)?;
-        writeln!(stdout, "{}", step_report_json(&report))
-            .map_err(|e| Error::Io(format!("stdout: {e}")))?;
+        let report = match parse_presentation_json(&line) {
+            Ok(presentation) => {
+                if opts.sequence {
+                    network.sequence_step(&presentation, opts.detailed)
+                } else {
+                    network.step(&presentation, opts.detailed)
+                }
+            }
+            Err(vector_error) => match parse_weighted_presentation_json(&line) {
+                Ok(presentation) => {
+                    if opts.sequence {
+                        network.sequence_step_weighted(&presentation, opts.detailed)
+                    } else {
+                        network.step_weighted(&presentation, opts.detailed)
+                    }
+                }
+                Err(_) => Err(Error::Invalid(format!(
+                    "stdin line {}: {vector_error}",
+                    line_no + 1
+                ))),
+            },
+        };
+        match report {
+            Ok(report) => {
+                write_step_report_json(&mut stdout, &report)
+                    .map_err(|e| Error::Io(format!("stdout: {e}")))?;
+                stdout
+                    .write_all(b"\n")
+                    .map_err(|e| Error::Io(format!("stdout: {e}")))?;
+            }
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    if opts.sequence {
+        let close = network.end_sequence();
+        if failure.is_none() {
+            close?;
+        }
+    }
+    if let Some(err) = failure {
+        return Err(err);
     }
     stdout
         .flush()
         .map_err(|e| Error::Io(format!("stdout: {e}")))?;
     if let Some(path) = &opts.save {
-        write_atomic(path, &network.export_json())?;
+        write_atomic(path, &network)?;
     }
     Ok(())
 }
@@ -199,11 +252,26 @@ fn run_summary(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn write_atomic(path: &str, contents: &str) -> Result<()> {
+fn write_atomic(path: &str, network: &Network) -> Result<()> {
     let tmp = format!("{path}.tmp");
-    fs::write(&tmp, contents).map_err(|e| Error::Io(format!("cannot write {tmp}: {e}")))?;
-    fs::rename(&tmp, path).map_err(|e| Error::Io(format!("cannot replace {path}: {e}")))?;
-    Ok(())
+    let result = (|| {
+        let file =
+            File::create(&tmp).map_err(|e| Error::Io(format!("cannot create {tmp}: {e}")))?;
+        let mut writer = BufWriter::new(file);
+        network
+            .write_json(&mut writer)
+            .map_err(|e| Error::Io(format!("cannot write {tmp}: {e}")))?;
+        writer
+            .flush()
+            .map_err(|e| Error::Io(format!("cannot flush {tmp}: {e}")))?;
+        drop(writer);
+        fs::rename(&tmp, path).map_err(|e| Error::Io(format!("cannot replace {path}: {e}")))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn print_help() {
@@ -213,18 +281,21 @@ fn print_help() {
            auxein run --dimension D --memory T (--budget B | --budget-units N) [options]\n\
            auxein run --load STATE (--budget B | --budget-units N) [options]\n\
            auxein summary --load STATE (--budget B | --budget-units N) [options]\n\n\
-         run reads one JSON presentation per stdin line and writes one StepReport JSON per line.\n\n\
+         run reads one JSON presentation per stdin line. By default every line is an\n\
+         atomic sequence. --sequence makes all nonempty stdin lines one explicit causal sequence.\n\n\
+         A presentation is either a list of vectors (uniform point-kernel sugar) or\n\
+         canonical [[W,C,V], ...] weighted kernels with total mass in (0,1].\n\n\
          Options:\n\
            --dimension D       vector dimension for a new state\n\
            --memory T          EMA half-life for a new state\n\
            --eta R             learning multiplier in [0,1] (default 1)\n\
            --scalar f32|f64    persistent scalar (default f64)\n\
-           --mode geometry|temporal|predictive\n\
+           --mode geometry|predictive\n\
                               engine mode for a new state (default geometry)\n\
+           --sequence          stdin lines form one explicit causal sequence\n\
            --budget B          exact-decimal ergonomic kernel capacity\n\
            --budget-units N    exact raw material budget\n\
-           --universe NAME     external readout universe (default auxein)\n\
-           --load FILE         load canonical format_version=4 JSON state\n\
+           --load FILE         load canonical format_version=5 JSON state\n\
            --save FILE         atomically save final canonical JSON state\n\
            --detailed          include LayerReport diagnostics\n",
         version = env!("CARGO_PKG_VERSION")

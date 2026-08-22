@@ -12,7 +12,10 @@ pub(crate) enum Value {
     Object(BTreeMap<String, Value>),
 }
 
+const MAX_JSON_NESTING: usize = 16;
+
 pub(crate) fn parse(input: &str) -> Result<Value> {
+    validate_nesting(input)?;
     let mut p = Parser {
         bytes: input.as_bytes(),
         pos: 0,
@@ -28,25 +31,39 @@ pub(crate) fn parse(input: &str) -> Result<Value> {
     Ok(value)
 }
 
-pub(crate) fn quote(out: &mut String, text: &str) {
-    out.push('"');
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if c < '\u{20}' => {
-                use std::fmt::Write;
-                let _ = write!(out, "\\u{:04x}", c as u32);
+fn validate_nesting(input: &str) -> Result<()> {
+    // format_version=5 state JSON reaches depth 6; presentations reach depth 3.
+    // Bound generic parser recursion above that schema maximum so hostile input
+    // becomes a normal parse error rather than a process-stack exhaustion.
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in input.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
             }
-            c => out.push(c),
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth = depth.saturating_add(1);
+                if depth > MAX_JSON_NESTING {
+                    return Err(Error::Json(
+                        "JSON nesting exceeds format safety bound".into(),
+                    ));
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
         }
     }
-    out.push('"');
+    Ok(())
 }
 
 struct Parser<'a> {
@@ -306,7 +323,8 @@ impl Parser<'_> {
                 return Err(Error::Json(format!("invalid number at byte {start}")));
             }
         }
-        let text = std::str::from_utf8(&self.bytes[start..self.pos]).unwrap();
+        let text = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|_| Error::Json(format!("invalid UTF-8 number at byte {start}")))?;
         let n: f64 = text
             .parse()
             .map_err(|_| Error::Json(format!("invalid number at byte {start}")))?;

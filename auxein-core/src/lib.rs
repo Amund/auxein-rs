@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Auxein v0.4.0 production core.
+//! Auxein v0.5.0 production core.
 //!
 //! The crate is deliberately dependency-free. Persistent geometry is stored
 //! in the selected scalar (`f32` or `f64`), every cognitive calculation is
@@ -12,20 +12,20 @@ mod json;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Write as IoWrite;
 use std::mem;
 use std::sync::{
-    atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering},
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
     Arc,
 };
 
-pub const FORMAT_VERSION: u64 = 4;
+pub const FORMAT_VERSION: u64 = 5;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Geometry,
-    Temporal,
     Predictive,
 }
 
@@ -33,10 +33,9 @@ impl Mode {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "geometry" => Ok(Self::Geometry),
-            "temporal" => Ok(Self::Temporal),
             "predictive" => Ok(Self::Predictive),
             _ => Err(Error::Invalid(
-                "mode must be 'geometry', 'temporal' or 'predictive'".into(),
+                "mode must be 'geometry' or 'predictive'".into(),
             )),
         }
     }
@@ -44,13 +43,8 @@ impl Mode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Geometry => "geometry",
-            Self::Temporal => "temporal",
             Self::Predictive => "predictive",
         }
-    }
-
-    pub const fn temporal(self) -> bool {
-        matches!(self, Self::Temporal | Self::Predictive)
     }
 
     pub const fn predictive(self) -> bool {
@@ -149,6 +143,7 @@ pub trait Scalar:
     fn to_f64(self) -> f64;
     fn bits(self) -> u64;
     fn min_positive() -> Self;
+    fn max_finite() -> Self;
 }
 
 impl Scalar for f32 {
@@ -177,6 +172,10 @@ impl Scalar for f32 {
     fn min_positive() -> Self {
         f32::from_bits(1)
     }
+
+    fn max_finite() -> Self {
+        f32::MAX
+    }
 }
 
 impl Scalar for f64 {
@@ -201,6 +200,10 @@ impl Scalar for f64 {
     fn min_positive() -> Self {
         f64::from_bits(1)
     }
+
+    fn max_finite() -> Self {
+        f64::MAX
+    }
 }
 
 // CELL support decays homothetically and has no authority while the CELL is
@@ -210,20 +213,20 @@ impl Scalar for f64 {
 // kernel never spans two lambda values.
 #[derive(Debug)]
 struct DecayClock {
-    epoch: AtomicU32,
+    epoch: AtomicU64,
     lambda_bits: AtomicU64,
 }
 
 impl DecayClock {
-    fn new(epoch: u32, lambda: f64) -> Self {
+    fn new(epoch: u64, lambda: f64) -> Self {
         Self {
-            epoch: AtomicU32::new(epoch),
+            epoch: AtomicU64::new(epoch),
             lambda_bits: AtomicU64::new(lambda.to_bits()),
         }
     }
 
     #[inline]
-    fn epoch(&self) -> u32 {
+    fn epoch(&self) -> u64 {
         self.epoch.load(AtomicOrdering::Relaxed)
     }
 
@@ -248,7 +251,7 @@ pub struct Kernel<S: Scalar> {
     norm2: f64,
     dirty: bool,
     decay_clock: Option<Arc<DecayClock>>,
-    decay_epoch: u32,
+    decay_epoch: u64,
 }
 
 impl<S: Scalar> Kernel<S> {
@@ -283,7 +286,7 @@ impl<S: Scalar> Kernel<S> {
     }
 
     #[inline]
-    fn materialize_weight_at(&mut self, epoch: u32, lambda: f64) -> f64 {
+    fn materialize_weight_at(&mut self, epoch: u64, lambda: f64) -> f64 {
         if self.decay_epoch != epoch {
             self.weight = decayed_weight::<S>(self.weight, self.decay_epoch, epoch, lambda);
             self.decay_epoch = epoch;
@@ -291,7 +294,7 @@ impl<S: Scalar> Kernel<S> {
         self.weight.to_f64()
     }
 
-    fn bind_decay_clock(&mut self, clock: Arc<DecayClock>, epoch: u32) {
+    fn bind_decay_clock(&mut self, clock: Arc<DecayClock>, epoch: u64) {
         self.decay_clock = Some(clock);
         self.decay_epoch = epoch;
     }
@@ -342,6 +345,10 @@ impl<S: Scalar> Clone for Layer<S> {
     fn clone(&self) -> Self {
         let epoch = self.cell_decay.epoch();
         let clock = Arc::new(DecayClock::new(epoch, self.cell_decay.lambda()));
+        let mut sigma = self.sigma.clone();
+        for kernel in &mut sigma {
+            kernel.bind_decay_clock(clock.clone(), kernel.decay_epoch);
+        }
         let mut cells = self.cells.clone();
         for cell in &mut cells {
             cell.bind_decay_clock(clock.clone(), cell.decay_epoch);
@@ -351,15 +358,19 @@ impl<S: Scalar> Clone for Layer<S> {
             temporal_epoch,
             self.temporal_decay.lambda(),
         ));
+        let mut temporal_sigma = self.temporal_sigma.clone();
+        for kernel in &mut temporal_sigma {
+            kernel.bind_decay_clock(temporal_clock.clone(), kernel.decay_epoch);
+        }
         let mut temporal_cells = self.temporal_cells.clone();
         for cell in &mut temporal_cells {
             cell.bind_decay_clock(temporal_clock.clone(), cell.decay_epoch);
         }
         Self {
-            sigma: self.sigma.clone(),
+            sigma,
             cells,
             cell_decay: clock,
-            temporal_sigma: self.temporal_sigma.clone(),
+            temporal_sigma,
             temporal_cells,
             temporal_decay: temporal_clock,
             previous: self.previous.clone(),
@@ -390,96 +401,62 @@ impl<S: Scalar> Layer<S> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Recognition {
-    pub universe: Arc<str>,
-    pub local_input: Arc<[f64]>,
-    pub recognised: Vec<f64>,
+pub struct InputAtom {
+    pub weight: f64,
+    pub center: Vec<f64>,
+    pub variance: f64,
 }
 
-impl Recognition {
-    pub fn universe(&self) -> &str {
-        &self.universe
-    }
-
-    pub fn local_input(&self) -> &[f64] {
-        &self.local_input
-    }
-
-    pub fn recognised(&self) -> &[f64] {
-        &self.recognised
+impl InputAtom {
+    pub fn new(weight: f64, center: Vec<f64>, variance: f64) -> Self {
+        Self {
+            weight,
+            center,
+            variance,
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct TemporalRecognition {
-    pub universe: Arc<str>,
-    pub previous_input: Arc<[f64]>,
-    pub current_input: Arc<[f64]>,
-    pub previous_recognised: Vec<f64>,
-    pub current_recognised: Vec<f64>,
+pub struct OutputAtom {
+    pub weight: f64,
+    pub center: Vec<f64>,
+    pub variance: f64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Prediction {
-    pub universe: Arc<str>,
-    pub current_context: Vec<f64>,
-    pub recognised_source: Vec<f64>,
-    pub predicted_successor: Vec<f64>,
-}
+pub type OutputPresentation = Vec<OutputAtom>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Readout {
-    Geometry(Vec<Recognition>),
-    Temporal {
-        concepts: Vec<Recognition>,
-        sequences: Vec<TemporalRecognition>,
+    Geometry {
+        present: Vec<OutputPresentation>,
     },
     Predictive {
-        concepts: Vec<Recognition>,
-        sequences: Vec<TemporalRecognition>,
-        predictions: Vec<Prediction>,
+        present: Vec<OutputPresentation>,
+        future: Vec<OutputPresentation>,
     },
 }
 
 impl Readout {
-    pub fn concepts(&self) -> &[Recognition] {
+    pub fn present(&self) -> &[OutputPresentation] {
         match self {
-            Self::Geometry(values) => values,
-            Self::Temporal { concepts, .. } | Self::Predictive { concepts, .. } => concepts,
+            Self::Geometry { present } | Self::Predictive { present, .. } => present,
         }
     }
 
-    pub fn sequences(&self) -> &[TemporalRecognition] {
+    pub fn future(&self) -> &[OutputPresentation] {
         match self {
-            Self::Geometry(_) => &[],
-            Self::Temporal { sequences, .. } | Self::Predictive { sequences, .. } => sequences,
-        }
-    }
-
-    pub fn predictions(&self) -> &[Prediction] {
-        match self {
-            Self::Predictive { predictions, .. } => predictions,
-            Self::Geometry(_) | Self::Temporal { .. } => &[],
+            Self::Geometry { .. } => &[],
+            Self::Predictive { future, .. } => future,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.concepts().is_empty() && self.sequences().is_empty() && self.predictions().is_empty()
+        self.present().is_empty() && self.future().is_empty()
     }
 
-    /// Number of conceptual recognitions. Geometry-mode callers can keep the
-    /// flat readout ergonomics while temporal callers inspect
-    /// `sequences()` explicitly.
     pub fn len(&self) -> usize {
-        self.concepts().len()
-    }
-}
-
-impl std::ops::Index<usize> for Readout {
-    type Output = Recognition;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.concepts()[index]
+        self.present().len()
     }
 }
 
@@ -537,6 +514,9 @@ pub struct LayerReport {
     pub context_center: Option<Vec<f64>>,
     pub context_variance: Option<f64>,
     pub recognition_count: usize,
+    pub knowledge_mass: f64,
+    pub present_atom_count: usize,
+    pub present_mass: f64,
     pub cell_responsibility_mass: Vec<f64>,
 }
 
@@ -556,7 +536,6 @@ pub struct StepReport {
 pub struct Summary {
     pub steps_seen: u64,
     pub dimension: usize,
-    pub universe: String,
     pub scalar: &'static str,
     pub memory: f64,
     pub eta: f64,
@@ -582,7 +561,6 @@ pub struct Auxein<S: Scalar> {
     dimension: usize,
     memory: S,
     eta: S,
-    universe: Arc<str>,
     mode: Mode,
     steps_seen: u64,
     layers: Vec<Layer<S>>,
@@ -594,6 +572,7 @@ pub struct Auxein<S: Scalar> {
     scratch_targets: Targets,
     scratch_concerned: Vec<(usize, f64)>,
     scratch_unknown: Vec<usize>,
+    sequence_open: bool,
 }
 
 impl<S: Scalar> Clone for Auxein<S> {
@@ -602,7 +581,6 @@ impl<S: Scalar> Clone for Auxein<S> {
             dimension: self.dimension,
             memory: self.memory,
             eta: self.eta,
-            universe: self.universe.clone(),
             mode: self.mode,
             steps_seen: self.steps_seen,
             layers: self.layers.clone(),
@@ -614,6 +592,7 @@ impl<S: Scalar> Clone for Auxein<S> {
             scratch_targets: Targets::default(),
             scratch_concerned: Vec::new(),
             scratch_unknown: Vec::new(),
+            sequence_open: false,
         }
     }
 }
@@ -664,27 +643,70 @@ struct Targets {
 }
 
 impl Targets {
-    fn reset(&mut self, count: usize, dimension: usize, need_centers: bool) {
+    fn reset(&mut self, count: usize, dimension: usize, need_centers: bool) -> Result<()> {
         for index in self.touched.drain(..) {
-            self.weights[index] = 0.0;
-            if index < self.batches.len() {
-                self.batches[index].clear();
+            let Some(weight) = self.weights.get_mut(index) else {
+                return Err(Error::Inexecutable(
+                    "scratch index escaped its population".into(),
+                ));
+            };
+            *weight = 0.0;
+            if let Some(batch) = self.batches.get_mut(index) {
+                batch.clear();
             }
         }
         self.dimension = dimension;
         if self.weights.len() < count {
+            self.weights
+                .try_reserve(count - self.weights.len())
+                .map_err(|_| Error::Inexecutable("cannot reserve target weights".into()))?;
+            self.variances
+                .try_reserve(count - self.variances.len())
+                .map_err(|_| Error::Inexecutable("cannot reserve target variances".into()))?;
             self.weights.resize(count, 0.0);
             self.variances.resize(count, 0.0);
         }
         if self.batches.len() < count {
+            self.batches
+                .try_reserve(count - self.batches.len())
+                .map_err(|_| Error::Inexecutable("cannot reserve target batches".into()))?;
             self.batches.resize_with(count, Vec::new);
         }
         if need_centers {
-            let center_count = count.saturating_mul(dimension);
+            let center_count = count
+                .checked_mul(dimension)
+                .ok_or_else(|| Error::Inexecutable("target scratch dimension overflow".into()))?;
             if self.centers.len() < center_count {
+                self.centers
+                    .try_reserve(center_count - self.centers.len())
+                    .map_err(|_| Error::Inexecutable("cannot reserve target centers".into()))?;
                 self.centers.resize(center_count, 0.0);
             }
         }
+        Ok(())
+    }
+
+    fn capacity_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let mut add = |capacity: usize, size: usize| {
+            total = total.saturating_add(capacity.saturating_mul(size));
+        };
+        add(self.weights.capacity(), std::mem::size_of::<f64>());
+        add(self.centers.capacity(), std::mem::size_of::<f64>());
+        add(self.variances.capacity(), std::mem::size_of::<f64>());
+        add(self.touched.capacity(), std::mem::size_of::<usize>());
+        add(self.changed.capacity(), std::mem::size_of::<usize>());
+        add(
+            self.batches.capacity(),
+            std::mem::size_of::<Vec<TargetContribution>>(),
+        );
+        for batch in &self.batches {
+            add(batch.capacity(), std::mem::size_of::<TargetContribution>());
+        }
+        add(self.sum_terms.capacity(), std::mem::size_of::<f64>());
+        add(self.variance_terms.capacity(), std::mem::size_of::<f64>());
+        add(self.sum_partials.capacity(), std::mem::size_of::<f64>());
+        total
     }
 
     fn mark_single(&mut self, index: usize, distance2: f64) {
@@ -782,6 +804,7 @@ impl Targets {
         }
     }
 
+    #[cfg(test)]
     fn apply_population<S: Scalar>(
         &mut self,
         kernels: &mut [Kernel<S>],
@@ -811,6 +834,7 @@ impl Targets {
         Ok(())
     }
 
+    #[cfg(test)]
     fn apply_single_population<S: Scalar>(
         &mut self,
         kernels: &mut [Kernel<S>],
@@ -843,7 +867,7 @@ impl Targets {
         presentation: &[Atom],
         beta: f64,
         lambda: f64,
-        epoch: u32,
+        epoch: u64,
     ) -> Result<()> {
         self.finalize_batches(presentation);
         if self.touched.windows(2).any(|pair| pair[0] > pair[1]) {
@@ -865,7 +889,7 @@ impl Targets {
         x: &[f64],
         beta: f64,
         lambda: f64,
-        epoch: u32,
+        epoch: u64,
     ) -> Result<()> {
         debug_assert!(self.touched.windows(2).all(|pair| pair[0] < pair[1]));
         for &index in &self.touched {
@@ -941,67 +965,116 @@ impl Targets {
         debug_assert!(target_weight > 0.0);
         let b = beta * target_weight;
         let total = a + b;
-        if total <= 0.0 || !total.is_finite() {
-            return Err(Error::Invalid(
-                "EMA produced nonpositive or nonfinite support".into(),
-            ));
+        if !(a >= 0.0 && b >= 0.0) || (a == 0.0 && b == 0.0) {
+            return Err(Error::Invalid("EMA produced nonpositive support".into()));
         }
-        let ratio = b / total;
+        // Compute the convex coefficient homogeneously if `a + b` overflows.
+        // The coefficient, not the particular intermediate sum, carries the
+        // cognitive authority.
+        let ratio = if total.is_finite() && total > 0.0 {
+            b / total
+        } else {
+            let scale = a.max(b);
+            if !(scale > 0.0 && scale.is_finite()) {
+                return Err(Error::Invalid("EMA produced invalid support".into()));
+            }
+            let an = a / scale;
+            let bn = b / scale;
+            bn / (an + bn)
+        };
+        let old_ratio = 1.0 - ratio;
         let mut changed = false;
-        let mut norm_sum = 0.0;
-        let mut norm_correction = 0.0;
         for (old_component, &new) in old.center.iter_mut().zip(target_center) {
             let old_value = old_component.to_f64();
-            let projected = S::from_f64(structural_zero(old_value + ratio * (new - old_value)))?;
+            // Convex form avoids overflowing `new - old` for opposite extreme
+            // finite coordinates.  A convex combination of representable
+            // endpoints is itself representable.
+            let value = structural_zero(old_ratio * old_value + ratio * new);
+            let projected = S::from_f64(value)?;
             changed |= projected != *old_component;
             *old_component = projected;
-            let value = projected.to_f64();
-            compensated_add(&mut norm_sum, &mut norm_correction, value * value);
         }
-        let variance = (a * old.variance.to_f64() + b * target_variance) / total
-            + (a / total) * (b / total) * delta2;
-        let mut weight = S::from_f64(total)?;
+        let variance_raw = old_ratio * old.variance.to_f64()
+            + ratio * target_variance
+            + old_ratio * ratio * delta2;
+        if variance_raw.is_nan() || variance_raw < 0.0 {
+            return Err(Error::Invalid("EMA produced invalid variance".into()));
+        }
+        let scalar_max = S::max_finite().to_f64();
+        let variance_value = structural_zero(if variance_raw.is_finite() {
+            variance_raw.min(scalar_max)
+        } else {
+            scalar_max
+        });
+        let weight_value = if total.is_finite() {
+            total.min(scalar_max)
+        } else {
+            scalar_max
+        };
+        let mut weight = S::from_f64(weight_value)?;
         if weight.to_f64() <= 0.0 {
             weight = S::min_positive();
         }
-        let variance = S::from_f64(structural_zero(variance))?;
-        if variance.to_f64() < 0.0 {
-            return Err(Error::Invalid(
-                "persistent kernel variance is negative".into(),
-            ));
-        }
+        let variance = S::from_f64(variance_value)?;
         changed |= variance != old.variance;
         old.weight = weight;
         old.variance = variance;
-        old.norm2 = compensated_finish(norm_sum, norm_correction);
+        old.norm2 = norm2_scalar(&old.center);
         old.dirty = changed;
         Ok(changed)
     }
 }
 
-#[inline(always)]
-fn decay_weight_once<S: Scalar>(weight: S, lambda: f64) -> S {
-    let mut next = <S as sealed::Sealed>::from_finite(lambda * weight.to_f64());
-    if next.to_f64() <= 0.0 {
-        next = S::min_positive();
+#[inline]
+fn decay_power(mut base: f64, mut exponent: u64) -> f64 {
+    let mut factor = 1.0;
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            factor *= base;
+            if factor == 0.0 {
+                return 0.0;
+            }
+        }
+        exponent >>= 1;
+        if exponent != 0 {
+            base *= base;
+            if base == 0.0 {
+                return 0.0;
+            }
+        }
     }
-    next
+    factor
 }
 
 #[inline]
-fn decayed_weight<S: Scalar>(mut weight: S, from_epoch: u32, to_epoch: u32, lambda: f64) -> S {
+fn decayed_weight<S: Scalar>(weight: S, from_epoch: u64, to_epoch: u64, lambda: f64) -> S {
     debug_assert!(from_epoch <= to_epoch);
     let age = to_epoch - from_epoch;
-    if age == 0 {
+    if age == 0 || lambda >= 1.0 {
         return weight;
     }
-    weight = decay_weight_once(weight, lambda);
-    for _ in 1..age {
-        weight = decay_weight_once(weight, lambda);
+    if lambda <= 0.0 {
+        return S::min_positive();
     }
-    weight
+
+    let initial = weight.to_f64();
+    let factor = decay_power(lambda, age);
+    let mut value = initial * factor;
+    if value == 0.0 && initial > 0.0 {
+        // Binary exponentiation can underflow the standalone factor even when
+        // initial * lambda^age remains representable.  Recover the product in
+        // log2 space; this is an implementation choice, not cognitive state.
+        let exponent = initial.log2() + (age as f64) * lambda.log2();
+        value = exponent.exp2();
+    }
+    let mut projected = <S as sealed::Sealed>::from_finite(value);
+    if projected.to_f64() <= 0.0 {
+        projected = S::min_positive();
+    }
+    projected
 }
 
+#[cfg(test)]
 fn decay_kernel<S: Scalar>(kernel: &mut Kernel<S>, lambda: f64) {
     let mut weight = <S as sealed::Sealed>::from_finite(lambda * kernel.weight.to_f64());
     if weight.to_f64() <= 0.0 {
@@ -1013,21 +1086,15 @@ fn decay_kernel<S: Scalar>(kernel: &mut Kernel<S>, lambda: f64) {
 struct LayerResult {
     output: Vec<Atom>,
     context: Option<Kernel64>,
-    readout: Vec<Recognition>,
+    knowledge: Vec<OutputAtom>,
     seed_requests: Vec<Kernel64>,
     transformations: Vec<Transformation>,
     report: Option<LayerReport>,
 }
 
 impl<S: Scalar> Auxein<S> {
-    pub fn new(
-        dimension: usize,
-        memory: f64,
-        eta: f64,
-        budget: Budget,
-        universe: impl Into<String>,
-    ) -> Result<Self> {
-        Self::new_with_mode(dimension, memory, eta, Mode::Geometry, budget, universe)
+    pub fn new(dimension: usize, memory: f64, eta: f64, budget: Budget) -> Result<Self> {
+        Self::new_with_mode(dimension, memory, eta, Mode::Geometry, budget)
     }
 
     pub fn new_with_mode(
@@ -1036,7 +1103,6 @@ impl<S: Scalar> Auxein<S> {
         eta: f64,
         mode: Mode,
         budget: Budget,
-        universe: impl Into<String>,
     ) -> Result<Self> {
         if dimension == 0 {
             return Err(Error::Invalid(
@@ -1049,18 +1115,12 @@ impl<S: Scalar> Auxein<S> {
         if !eta.is_finite() || !(0.0..=1.0).contains(&eta) {
             return Err(Error::Invalid("eta must lie in [0, 1]".into()));
         }
-        let universe = universe.into();
-        if universe.is_empty() {
-            return Err(Error::Invalid("universe must be nonempty".into()));
-        }
-        let universe: Arc<str> = Arc::from(universe);
         let memory = S::from_f64(memory)?;
         let eta = S::from_f64(eta)?;
         let mut out = Self {
             dimension,
             memory,
             eta,
-            universe,
             mode,
             steps_seen: 0,
             layers: vec![Layer {
@@ -1080,6 +1140,7 @@ impl<S: Scalar> Auxein<S> {
             scratch_targets: Targets::default(),
             scratch_concerned: Vec::new(),
             scratch_unknown: Vec::new(),
+            sequence_open: false,
         };
         out.refresh_clock();
         out.layers[0].cell_decay = Arc::new(DecayClock::new(0, out.lambda));
@@ -1114,10 +1175,6 @@ impl<S: Scalar> Auxein<S> {
         self.eta.to_f64()
     }
 
-    pub fn universe(&self) -> &str {
-        &self.universe
-    }
-
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -1136,6 +1193,30 @@ impl<S: Scalar> Auxein<S> {
 
     pub fn lambda(&self) -> f64 {
         self.lambda
+    }
+
+    /// Capacity retained only for transient per-step scratch buffers.
+    pub fn transient_memory_capacity_bytes(&self) -> usize {
+        self.scratch_targets
+            .capacity_bytes()
+            .saturating_add(
+                self.scratch_concerned
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(usize, f64)>()),
+            )
+            .saturating_add(
+                self.scratch_unknown
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+    }
+
+    /// Drop transient high-water allocations without touching persistent
+    /// cognition. Useful after exceptional bursts in long-running hosts.
+    pub fn compact_transient_memory(&mut self) {
+        self.scratch_targets = Targets::default();
+        self.scratch_concerned = Vec::new();
+        self.scratch_unknown = Vec::new();
     }
 
     pub fn kernel_units(&self) -> Result<u64> {
@@ -1162,7 +1243,7 @@ impl<S: Scalar> Auxein<S> {
     pub fn layer_units(&self) -> Result<u64> {
         match self.mode {
             Mode::Geometry => Ok(16),
-            Mode::Temporal | Mode::Predictive => 33u64
+            Mode::Predictive => 33u64
                 .checked_add(self.kernel_units()?)
                 .ok_or_else(|| Error::Invalid("material accounting overflow".into())),
         }
@@ -1219,12 +1300,18 @@ impl<S: Scalar> Auxein<S> {
         for layer in &mut self.layers {
             let epoch = layer.cell_decay.epoch();
             let lambda = layer.cell_decay.lambda();
+            for kernel in &mut layer.sigma {
+                kernel.materialize_weight_at(epoch, lambda);
+            }
             for cell in &mut layer.cells {
                 cell.materialize_weight_at(epoch, lambda);
             }
-            if self.mode.temporal() {
+            if self.mode.predictive() {
                 let epoch = layer.temporal_decay.epoch();
                 let lambda = layer.temporal_decay.lambda();
+                for kernel in &mut layer.temporal_sigma {
+                    kernel.materialize_weight_at(epoch, lambda);
+                }
                 for cell in &mut layer.temporal_cells {
                     cell.materialize_weight_at(epoch, lambda);
                 }
@@ -1233,11 +1320,17 @@ impl<S: Scalar> Auxein<S> {
         self.eta = eta;
         self.refresh_clock();
         for layer in &mut self.layers {
+            for kernel in &mut layer.sigma {
+                kernel.decay_epoch = 0;
+            }
             for cell in &mut layer.cells {
                 cell.decay_epoch = 0;
             }
             layer.cell_decay.reset(self.lambda);
-            if self.mode.temporal() {
+            if self.mode.predictive() {
+                for kernel in &mut layer.temporal_sigma {
+                    kernel.decay_epoch = 0;
+                }
                 for cell in &mut layer.temporal_cells {
                     cell.decay_epoch = 0;
                 }
@@ -1262,7 +1355,7 @@ impl<S: Scalar> Auxein<S> {
                     )
                 })
                 .ok_or_else(|| Error::Invalid("material accounting overflow".into()))?;
-            if self.mode.temporal() {
+            if self.mode.predictive() {
                 total = total
                     .checked_add(
                         ((layer.temporal_sigma.len() + layer.temporal_cells.len()) as u64)
@@ -1276,37 +1369,261 @@ impl<S: Scalar> Auxein<S> {
     }
 
     pub fn cell_value(cell: &Kernel<S>) -> f64 {
-        cell.norm2 / (cell.norm2 + cell.variance.to_f64())
+        let variance = cell.variance.to_f64();
+        if variance <= 0.0 {
+            return 1.0;
+        }
+        let norm2 = cell.norm2;
+        let denominator = norm2 + variance;
+        if norm2.is_finite() && norm2 > 0.0 && denominator.is_finite() {
+            return norm2 / denominator;
+        }
+
+        // K is homogeneous.  Re-evaluate it in scaled coordinates whenever a
+        // squared norm overflowed/underflowed.  A persistent CELL center is
+        // nonzero, so K must stay strictly positive.
+        let mut scale = variance.sqrt();
+        for &component in &cell.center {
+            scale = scale.max(component.to_f64().abs());
+        }
+        if !(scale > 0.0 && scale.is_finite()) {
+            return f64::MIN_POSITIVE;
+        }
+        let center2 = stable_sum(cell.center.iter().map(|&component| {
+            let x = component.to_f64() / scale;
+            x * x
+        }));
+        let v = {
+            let x = variance.sqrt() / scale;
+            x * x
+        };
+        let denominator = center2 + v;
+        let k = if denominator > 0.0 && denominator.is_finite() {
+            center2 / denominator
+        } else {
+            0.0
+        };
+        if k > 0.0 && k.is_finite() {
+            k.min(1.0)
+        } else {
+            f64::MIN_POSITIVE
+        }
     }
 
+    /// Process one uniform vector presentation as an atomic sequence.
     pub fn step(&mut self, presentation: &[Vec<f64>], detailed_report: bool) -> Result<StepReport> {
-        let presentation = self.presentation(presentation)?;
+        if self.sequence_open {
+            return Err(Error::Invalid(
+                "step cannot be used while a sequence is open".into(),
+            ));
+        }
+        let atoms = self.presentation(presentation)?;
+        self.invalidate_previous();
+        self.sequence_open = true;
+        let result = self.step_atoms(atoms, detailed_report);
+        self.invalidate_previous();
+        self.sequence_open = false;
+        result
+    }
+
+    /// Process one canonical weighted presentation as an atomic sequence.
+    pub fn step_weighted(
+        &mut self,
+        presentation: &[InputAtom],
+        detailed_report: bool,
+    ) -> Result<StepReport> {
+        if self.sequence_open {
+            return Err(Error::Invalid(
+                "step_weighted cannot be used while a sequence is open".into(),
+            ));
+        }
+        let atoms = self.weighted_presentation(presentation)?;
+        self.invalidate_previous();
+        self.sequence_open = true;
+        let result = self.step_atoms(atoms, detailed_report);
+        self.invalidate_previous();
+        self.sequence_open = false;
+        result
+    }
+
+    /// Open an explicit causal sequence. By default restored causal registers
+    /// are discarded; `resume=true` is the explicit opt-in for mid-sequence
+    /// continuation after state restoration.
+    pub fn begin_sequence(&mut self, resume: bool) -> Result<()> {
+        if self.sequence_open {
+            return Err(Error::Invalid("a sequence is already open".into()));
+        }
+        if !resume {
+            self.invalidate_previous();
+        }
+        self.sequence_open = true;
+        Ok(())
+    }
+
+    /// Close the current sequence and destroy all causal continuity.
+    pub fn end_sequence(&mut self) -> Result<()> {
+        if !self.sequence_open {
+            return Err(Error::Invalid("no sequence is open".into()));
+        }
+        self.invalidate_previous();
+        self.sequence_open = false;
+        Ok(())
+    }
+
+    /// Process one uniform vector presentation inside an explicitly open sequence.
+    pub fn sequence_step(
+        &mut self,
+        presentation: &[Vec<f64>],
+        detailed_report: bool,
+    ) -> Result<StepReport> {
+        if !self.sequence_open {
+            return Err(Error::Invalid(
+                "sequence_step requires begin_sequence".into(),
+            ));
+        }
+        let atoms = self.presentation(presentation)?;
+        self.step_atoms(atoms, detailed_report)
+    }
+
+    /// Process one weighted presentation inside an explicitly open sequence.
+    pub fn sequence_step_weighted(
+        &mut self,
+        presentation: &[InputAtom],
+        detailed_report: bool,
+    ) -> Result<StepReport> {
+        if !self.sequence_open {
+            return Err(Error::Invalid(
+                "sequence_step_weighted requires begin_sequence".into(),
+            ));
+        }
+        let atoms = self.weighted_presentation(presentation)?;
+        self.step_atoms(atoms, detailed_report)
+    }
+
+    /// Process a finite nonempty explicit sequence of uniform vector presentations.
+    pub fn sequence(
+        &mut self,
+        presentations: &[Vec<Vec<f64>>],
+        detailed_report: bool,
+    ) -> Result<Vec<StepReport>> {
+        if presentations.is_empty() {
+            return Err(Error::Invalid("sequence must be nonempty".into()));
+        }
+        self.begin_sequence(false)?;
+        let mut reports = Vec::new();
+        reports
+            .try_reserve(presentations.len())
+            .map_err(|_| Error::Inexecutable("cannot reserve sequence reports".into()))?;
+        let mut failure = None;
+        for presentation in presentations {
+            match self.sequence_step(presentation, detailed_report) {
+                Ok(report) => reports.push(report),
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+        }
+        let close = self.end_sequence();
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        close?;
+        Ok(reports)
+    }
+
+    /// Process a finite nonempty explicit sequence of weighted presentations.
+    pub fn sequence_weighted(
+        &mut self,
+        presentations: &[Vec<InputAtom>],
+        detailed_report: bool,
+    ) -> Result<Vec<StepReport>> {
+        if presentations.is_empty() {
+            return Err(Error::Invalid("sequence must be nonempty".into()));
+        }
+        self.begin_sequence(false)?;
+        let mut reports = Vec::new();
+        reports
+            .try_reserve(presentations.len())
+            .map_err(|_| Error::Inexecutable("cannot reserve sequence reports".into()))?;
+        let mut failure = None;
+        for presentation in presentations {
+            match self.sequence_step_weighted(presentation, detailed_report) {
+                Ok(report) => reports.push(report),
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+        }
+        let close = self.end_sequence();
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        close?;
+        Ok(reports)
+    }
+
+    /// Canonical direct NETWORK -> NETWORK composition: every upstream
+    /// depth presentation is consumed as an independent atomic sequence.
+    pub fn consume(
+        &mut self,
+        present_family: &[OutputPresentation],
+        detailed_report: bool,
+    ) -> Result<Vec<StepReport>> {
+        if self.sequence_open {
+            return Err(Error::Invalid(
+                "consume cannot be used while a sequence is open".into(),
+            ));
+        }
+        self.invalidate_previous();
+        let mut reports = Vec::new();
+        reports
+            .try_reserve(present_family.len())
+            .map_err(|_| Error::Inexecutable("cannot reserve composition reports".into()))?;
+        for presentation in present_family {
+            let input: Vec<InputAtom> = presentation
+                .iter()
+                .map(|atom| InputAtom {
+                    weight: atom.weight,
+                    center: atom.center.clone(),
+                    variance: atom.variance,
+                })
+                .collect();
+            reports.push(self.step_weighted(&input, detailed_report)?);
+        }
+        self.invalidate_previous();
+        Ok(reports)
+    }
+
+    fn step_atoms(&mut self, presentation: Vec<Atom>, detailed_report: bool) -> Result<StepReport> {
         let mut transformations = Vec::new();
         self.force_solvency(&mut transformations)?;
         let maintenance_open = self.maintenance_units()?;
         let layer_count_start = self.layers.len();
-        let mut concept_readout = Vec::new();
-        let mut readout_layers = 0usize;
-        let mut sequence_readout = Vec::new();
-        let mut prediction_readout = Vec::new();
+        let mut present_family: Vec<OutputPresentation> = Vec::new();
+        let mut future_family: Vec<OutputPresentation> = Vec::new();
         let mut all_seed_requests: Vec<(Space, usize, Kernel64)> = Vec::new();
         let mut layer_reports = Vec::new();
         let mut temporal_reports = Vec::new();
         let mut contexts: Vec<Option<Kernel64>> = vec![None; layer_count_start];
         let mut frontier_requested = false;
 
-        // Complete geometric recursion first. Temporal cognition observes the
-        // resulting contexts but can never feed back into geometry in the same step.
+        // Complete geometric recursion first. Predictive-private temporal
+        // cognition observes the resulting contexts but never feeds back into
+        // geometry in the same presentation.
         let mut current = presentation;
         for (layer_index, context_slot) in contexts.iter_mut().enumerate().take(layer_count_start) {
             if current.is_empty() {
                 break;
             }
             let result = self.process_layer(layer_index, &current, detailed_report)?;
-            *context_slot = result.context.clone();
-            if !result.readout.is_empty() {
-                readout_layers += 1;
-                concept_readout.extend(result.readout);
+            *context_slot = result.context;
+            if !result.knowledge.is_empty() {
+                present_family.push(complete_output_presentation(
+                    result.knowledge,
+                    self.dimension,
+                )?);
             }
             transformations.extend(result.transformations);
             all_seed_requests.extend(
@@ -1325,7 +1642,7 @@ impl<S: Scalar> Auxein<S> {
             current = result.output;
         }
 
-        if self.mode.temporal() {
+        if self.mode.predictive() {
             for (layer_index, context_slot) in contexts.iter().enumerate().take(layer_count_start) {
                 let previous = self.layers[layer_index]
                     .previous
@@ -1338,29 +1655,92 @@ impl<S: Scalar> Auxein<S> {
                 let context = context_slot.as_ref();
 
                 // Prediction reads only temporal CELLs that already existed
-                // before this layer's temporal learning phase. It projects
-                // source/target centers and never reconstructs endpoint variance.
-                if self.mode.predictive() {
-                    if let Some(context) = context {
-                        for cell in &self.layers[layer_index].temporal_cells {
+                // before this presentation's private temporal learning phase.
+                if let Some(context) = context {
+                    let temporal_cells = &self.layers[layer_index].temporal_cells;
+                    if !temporal_cells.is_empty() {
+                        let d0 = norm2(&context.center);
+                        let candidate_range =
+                            first_coordinate_candidate_range(temporal_cells, context.center[0], d0);
+                        let current_nonzero = context.center.iter().any(|&x| x != 0.0);
+                        let mut matches = candidate_range.clone().filter_map(|index| {
+                            let cell = &temporal_cells[index];
                             debug_assert_eq!(cell.center.len(), self.dimension * 2);
-                            let source = &cell.center[..self.dimension];
-                            if point_concern_scalar(&context.center, source) {
-                                prediction_readout.push(Prediction {
-                                    universe: self.universe.clone(),
-                                    current_context: context.center.clone(),
-                                    recognised_source: scalar_vec_to_f64(source),
-                                    predicted_successor: scalar_vec_to_f64(
-                                        &cell.center[self.dimension..],
-                                    ),
+                            point_relative_gain_scalar(
+                                &context.center,
+                                d0,
+                                current_nonzero,
+                                &cell.center[..self.dimension],
+                            )
+                            .map(|gamma| (index, gamma))
+                        });
+                        if let Some(first) = matches.next() {
+                            if let Some(second) = matches.next() {
+                                let mut future_matches = Vec::new();
+                                future_matches
+                                    .try_reserve(candidate_range.len().min(temporal_cells.len()))
+                                    .map_err(|_| {
+                                        Error::Inexecutable(
+                                            "cannot reserve predictive candidate matches".into(),
+                                        )
+                                    })?;
+                                future_matches.push(first);
+                                future_matches.push(second);
+                                future_matches.extend(matches);
+                                future_matches.sort_unstable_by(|&(a, _), &(b, _)| {
+                                    cmp_scalar_vec(
+                                        &temporal_cells[a].center[self.dimension..],
+                                        &temporal_cells[b].center[self.dimension..],
+                                    )
                                 });
+
+                                let mut group_start = 0;
+                                while group_start < future_matches.len() {
+                                    let (index, mut max_gamma) = future_matches[group_start];
+                                    let target_slice =
+                                        &temporal_cells[index].center[self.dimension..];
+                                    let mut group_end = group_start + 1;
+                                    while group_end < future_matches.len() {
+                                        let (other_index, gamma) = future_matches[group_end];
+                                        if temporal_cells[other_index].center[self.dimension..]
+                                            != *target_slice
+                                        {
+                                            break;
+                                        }
+                                        max_gamma = max_gamma.max(gamma);
+                                        group_end += 1;
+                                    }
+                                    let target = scalar_vec_to_f64(target_slice);
+                                    future_family.push(complete_output_presentation(
+                                        vec![OutputAtom {
+                                            weight: context.weight * max_gamma,
+                                            center: target,
+                                            variance: 0.0,
+                                        }],
+                                        self.dimension,
+                                    )?);
+                                    group_start = group_end;
+                                }
+                            } else {
+                                let (index, gamma) = first;
+                                let target = scalar_vec_to_f64(
+                                    &temporal_cells[index].center[self.dimension..],
+                                );
+                                future_family.push(complete_output_presentation(
+                                    vec![OutputAtom {
+                                        weight: context.weight * gamma,
+                                        center: target,
+                                        variance: 0.0,
+                                    }],
+                                    self.dimension,
+                                )?);
                             }
                         }
                     }
                 }
 
                 if let (Some(previous), Some(context)) = (previous.as_ref(), context) {
-                    let atom = self.temporal_atom(previous, context);
+                    let atom = self.temporal_atom(previous, context)?;
                     let result = self.process_temporal(layer_index, &[atom], detailed_report)?;
                     transformations.extend(result.transformations);
                     all_seed_requests.extend(
@@ -1369,25 +1749,13 @@ impl<S: Scalar> Auxein<S> {
                             .into_iter()
                             .map(|seed| (Space::Temporal, layer_index, seed)),
                     );
-                    for recognition in result.readout {
-                        let input = recognition.local_input.as_ref();
-                        let recognised = &recognition.recognised;
-                        debug_assert_eq!(input.len(), self.dimension * 2);
-                        debug_assert_eq!(recognised.len(), self.dimension * 2);
-                        sequence_readout.push(TemporalRecognition {
-                            universe: self.universe.clone(),
-                            previous_input: Arc::from(input[..self.dimension].to_vec()),
-                            current_input: Arc::from(input[self.dimension..].to_vec()),
-                            previous_recognised: recognised[..self.dimension].to_vec(),
-                            current_recognised: recognised[self.dimension..].to_vec(),
-                        });
-                    }
                     if let Some(report) = result.report {
                         temporal_reports.push(report);
                     }
                 }
 
-                // P_k is causal state, not learned memory: it advances even at eta=0.
+                // P_k is causal state, not learned memory: it advances even at
+                // eta=0, but only inside the explicit sequence boundary.
                 let next_previous = context_slot
                     .as_ref()
                     .map(|context| self.project_previous(context))
@@ -1396,11 +1764,8 @@ impl<S: Scalar> Auxein<S> {
             }
         }
 
-        // One material transaction spans both kinds of seed and the optional
-        // new frontier layer. The economy never selects a subset. Admission
-        // is evaluated on the geometry that will actually persist after
-        // scalar projection: a raw seed can become zero, covered, or an exact
-        // clone only at that boundary (notably in f32).
+        // One material transaction spans geometric and predictive-private
+        // temporal seeds plus the optional frontier layer.
         let mut projected_geometry: Vec<Vec<Kernel<S>>> =
             (0..layer_count_start).map(|_| Vec::new()).collect();
         let mut projected_temporal: Vec<Vec<Kernel<S>>> =
@@ -1414,7 +1779,16 @@ impl<S: Scalar> Auxein<S> {
                 Space::Geometry => &self.layers[layer_index].cells,
                 Space::Temporal => &self.layers[layer_index].temporal_cells,
             };
-            if cells.iter().any(|cell| concern_kernel(cell, &projected).0) {
+            let projected_center = scalar_vec_to_f64(&projected.center);
+            if cells.iter().any(|cell| {
+                concern_raw_kernel(
+                    cell,
+                    &projected_center,
+                    projected.variance.to_f64(),
+                    projected.norm2,
+                )
+                .0
+            }) {
                 continue;
             }
             match space {
@@ -1423,41 +1797,41 @@ impl<S: Scalar> Auxein<S> {
             }
         }
 
-        let mut future_geometry: Vec<Option<Vec<Kernel<S>>>> =
-            (0..layer_count_start).map(|_| None).collect();
-        let mut future_temporal: Vec<Option<Vec<Kernel<S>>>> =
-            (0..layer_count_start).map(|_| None).collect();
         let mut geometric_seeds = 0usize;
         let mut temporal_seeds = 0usize;
         let mut net_new_geometry = 0usize;
         let mut net_new_temporal = 0usize;
 
+        // Coalesce only the new requests first.  The existing Sigma state is
+        // left untouched until the global material transaction is known to be
+        // payable; rejection therefore allocates no full future copy.
         for layer_index in 0..layer_count_start {
+            geometric_seeds = geometric_seeds
+                .checked_add(projected_geometry[layer_index].len())
+                .ok_or_else(|| Error::Invalid("seed accounting overflow".into()))?;
+            temporal_seeds = temporal_seeds
+                .checked_add(projected_temporal[layer_index].len())
+                .ok_or_else(|| Error::Invalid("seed accounting overflow".into()))?;
+
             if !projected_geometry[layer_index].is_empty() {
-                geometric_seeds = geometric_seeds
-                    .checked_add(projected_geometry[layer_index].len())
-                    .ok_or_else(|| Error::Invalid("seed accounting overflow".into()))?;
-                let existing_len = self.layers[layer_index].sigma.len();
-                let mut future = self.layers[layer_index].sigma.clone();
-                future.append(&mut projected_geometry[layer_index]);
-                let future = coalesce_projected(future)?;
+                let additions = mem::take(&mut projected_geometry[layer_index]);
+                projected_geometry[layer_index] = coalesce_projected(additions)?;
                 net_new_geometry = net_new_geometry
-                    .checked_add(future.len().saturating_sub(existing_len))
+                    .checked_add(count_new_geometries(
+                        &self.layers[layer_index].sigma,
+                        &projected_geometry[layer_index],
+                    ))
                     .ok_or_else(|| Error::Invalid("seed accounting overflow".into()))?;
-                future_geometry[layer_index] = Some(future);
             }
             if !projected_temporal[layer_index].is_empty() {
-                temporal_seeds = temporal_seeds
-                    .checked_add(projected_temporal[layer_index].len())
-                    .ok_or_else(|| Error::Invalid("seed accounting overflow".into()))?;
-                let existing_len = self.layers[layer_index].temporal_sigma.len();
-                let mut future = self.layers[layer_index].temporal_sigma.clone();
-                future.append(&mut projected_temporal[layer_index]);
-                let future = coalesce_projected(future)?;
+                let additions = mem::take(&mut projected_temporal[layer_index]);
+                projected_temporal[layer_index] = coalesce_projected(additions)?;
                 net_new_temporal = net_new_temporal
-                    .checked_add(future.len().saturating_sub(existing_len))
+                    .checked_add(count_new_geometries(
+                        &self.layers[layer_index].temporal_sigma,
+                        &projected_temporal[layer_index],
+                    ))
                     .ok_or_else(|| Error::Invalid("seed accounting overflow".into()))?;
-                future_temporal[layer_index] = Some(future);
             }
         }
 
@@ -1486,17 +1860,31 @@ impl<S: Scalar> Auxein<S> {
 
         let transaction_requested = seed_count > 0 || frontier_requested;
         if transaction_requested {
-            let payable = self
-                .maintenance_units()?
+            // Promotions and other transformations earlier in this same step
+            // may have changed maintenance.  Solvency is decided against the
+            // state that will actually receive the transaction, not the
+            // administrative snapshot taken at step entry.
+            let maintenance_before_growth = self.maintenance_units()?;
+            let payable = maintenance_before_growth
                 .checked_add(growth_cost)
-                .is_some_and(|n| n <= self.budget_units);
+                .is_some_and(|units| units <= self.budget_units);
             if payable {
                 for layer_index in 0..layer_count_start {
-                    if let Some(future) = future_geometry[layer_index].take() {
-                        self.layers[layer_index].sigma = future;
+                    if !projected_geometry[layer_index].is_empty() {
+                        let existing = mem::take(&mut self.layers[layer_index].sigma);
+                        let additions = mem::take(&mut projected_geometry[layer_index]);
+                        let clock = self.layers[layer_index].cell_decay.clone();
+                        let epoch = clock.epoch();
+                        self.layers[layer_index].sigma =
+                            merge_projected(existing, additions, clock, epoch)?;
                     }
-                    if let Some(future) = future_temporal[layer_index].take() {
-                        self.layers[layer_index].temporal_sigma = future;
+                    if !projected_temporal[layer_index].is_empty() {
+                        let existing = mem::take(&mut self.layers[layer_index].temporal_sigma);
+                        let additions = mem::take(&mut projected_temporal[layer_index]);
+                        let clock = self.layers[layer_index].temporal_decay.clone();
+                        let epoch = clock.epoch();
+                        self.layers[layer_index].temporal_sigma =
+                            merge_projected(existing, additions, clock, epoch)?;
                     }
                 }
                 if frontier_requested {
@@ -1528,10 +1916,8 @@ impl<S: Scalar> Auxein<S> {
             }
         }
 
-        self.steps_seen = self
-            .steps_seen
-            .checked_add(1)
-            .ok_or_else(|| Error::Invalid("steps_seen overflow".into()))?;
+        let step_index = self.steps_seen;
+        self.steps_seen = self.steps_seen.saturating_add(1);
         let maintenance_end = self.maintenance_units()?;
         if maintenance_end > self.budget_units {
             return Err(Error::Inexecutable(
@@ -1539,27 +1925,19 @@ impl<S: Scalar> Auxein<S> {
             ));
         }
 
-        if readout_layers <= 1 {
-            dedup_single_layer_recognitions(&mut concept_readout);
-        } else {
-            sort_dedup_recognitions(&mut concept_readout);
-        }
-        sort_dedup_temporal_recognitions(&mut sequence_readout);
-        sort_dedup_predictions(&mut prediction_readout);
+        future_family.sort_by(output_presentation_cmp);
+        future_family.dedup();
         let readout = match self.mode {
-            Mode::Geometry => Readout::Geometry(concept_readout),
-            Mode::Temporal => Readout::Temporal {
-                concepts: concept_readout,
-                sequences: sequence_readout,
+            Mode::Geometry => Readout::Geometry {
+                present: present_family,
             },
             Mode::Predictive => Readout::Predictive {
-                concepts: concept_readout,
-                sequences: sequence_readout,
-                predictions: prediction_readout,
+                present: present_family,
+                future: future_family,
             },
         };
         Ok(StepReport {
-            step_index: self.steps_seen - 1,
+            step_index,
             readout,
             transformations,
             maintenance_open_units: maintenance_open,
@@ -1577,7 +1955,10 @@ impl<S: Scalar> Auxein<S> {
             ));
         }
         let total = value.len() as f64;
-        let mut atoms = Vec::with_capacity(value.len());
+        let mut atoms = Vec::new();
+        atoms
+            .try_reserve(value.len())
+            .map_err(|_| Error::Inexecutable("cannot reserve presentation atoms".into()))?;
         for (i, x) in value.iter().enumerate() {
             if x.len() != self.dimension {
                 return Err(Error::Invalid(format!(
@@ -1585,7 +1966,10 @@ impl<S: Scalar> Auxein<S> {
                     self.dimension
                 )));
             }
-            let mut canonical = Vec::with_capacity(self.dimension);
+            let mut canonical = Vec::new();
+            canonical
+                .try_reserve(self.dimension)
+                .map_err(|_| Error::Inexecutable("cannot reserve presentation vector".into()))?;
             let mut norm_sum = 0.0;
             let mut norm_correction = 0.0;
             let mut zero = true;
@@ -1593,6 +1977,12 @@ impl<S: Scalar> Auxein<S> {
                 if !component.is_finite() {
                     return Err(Error::Invalid(format!(
                         "presentation[{i}] must contain only finite reals"
+                    )));
+                }
+                if self.beta > 0.0 && component.abs() > S::max_finite().to_f64() {
+                    return Err(Error::Invalid(format!(
+                        "presentation[{i}] exceeds persistent {} range while learning is enabled",
+                        S::NAME
                     )));
                 }
                 let component = structural_zero(component);
@@ -1618,6 +2008,80 @@ impl<S: Scalar> Auxein<S> {
         Ok(atoms)
     }
 
+    fn weighted_presentation(&self, value: &[InputAtom]) -> Result<Vec<Atom>> {
+        if value.is_empty() {
+            return Err(Error::Invalid(
+                "external presentation must be a nonempty sequence".into(),
+            ));
+        }
+        let mut atoms = Vec::new();
+        atoms.try_reserve(value.len()).map_err(|_| {
+            Error::Inexecutable("cannot reserve weighted presentation atoms".into())
+        })?;
+        for (i, item) in value.iter().enumerate() {
+            if !item.weight.is_finite() || item.weight <= 0.0 {
+                return Err(Error::Invalid(format!(
+                    "presentation[{i}].weight must be finite and positive"
+                )));
+            }
+            if item.center.len() != self.dimension {
+                return Err(Error::Invalid(format!(
+                    "presentation[{i}].center must have dimension {}",
+                    self.dimension
+                )));
+            }
+            if !item.variance.is_finite() || item.variance < 0.0 {
+                return Err(Error::Invalid(format!(
+                    "presentation[{i}].variance must be finite and nonnegative"
+                )));
+            }
+            if self.beta > 0.0 && item.variance > S::max_finite().to_f64() {
+                return Err(Error::Invalid(format!(
+                    "presentation[{i}].variance exceeds persistent {} range while learning is enabled",
+                    S::NAME
+                )));
+            }
+            let mut center = Vec::new();
+            center.try_reserve(self.dimension).map_err(|_| {
+                Error::Inexecutable("cannot reserve weighted presentation vector".into())
+            })?;
+            let mut norm_sum = 0.0;
+            let mut norm_correction = 0.0;
+            let mut zero = true;
+            for &component in &item.center {
+                if !component.is_finite() {
+                    return Err(Error::Invalid(format!(
+                        "presentation[{i}].center must contain only finite reals"
+                    )));
+                }
+                if self.beta > 0.0 && component.abs() > S::max_finite().to_f64() {
+                    return Err(Error::Invalid(format!(
+                        "presentation[{i}].center exceeds persistent {} range while learning is enabled",
+                        S::NAME
+                    )));
+                }
+                let component = structural_zero(component);
+                zero &= component == 0.0;
+                compensated_add(&mut norm_sum, &mut norm_correction, component * component);
+                center.push(component);
+            }
+            atoms.push(Atom {
+                x: Arc::from(center),
+                r: structural_zero(item.weight),
+                variance: structural_zero(item.variance),
+                norm2: compensated_finish(norm_sum, norm_correction),
+                zero,
+            });
+        }
+        let total = stable_sum(atoms.iter().map(|atom| atom.r));
+        if !(total > 0.0 && total <= 1.0) {
+            return Err(Error::Invalid(
+                "presentation mass must lie in (0, 1]".into(),
+            ));
+        }
+        Ok(coalesce_atoms(atoms))
+    }
+
     fn process_compartment(
         &mut self,
         layer_index: usize,
@@ -1635,8 +2099,12 @@ impl<S: Scalar> Auxein<S> {
 
         let layer = &mut self.layers[layer_index];
         let mut cell_epoch = layer.cell_decay.epoch();
-        if cell_epoch == u32::MAX {
+        if cell_epoch == u64::MAX {
             let lambda = layer.cell_decay.lambda();
+            for kernel in &mut layer.sigma {
+                kernel.materialize_weight_at(cell_epoch, lambda);
+                kernel.decay_epoch = 0;
+            }
             for cell in &mut layer.cells {
                 cell.materialize_weight_at(cell_epoch, lambda);
                 cell.decay_epoch = 0;
@@ -1645,27 +2113,39 @@ impl<S: Scalar> Auxein<S> {
             cell_epoch = 0;
         }
         let cell_decay_clock = layer.cell_decay.clone();
-        let mut old_cells = mem::take(&mut layer.cells);
-        let old_sigma = mem::take(&mut layer.sigma);
-        debug_assert!(old_cells.iter().all(|kernel| !kernel.dirty));
-        debug_assert!(old_sigma.iter().all(|kernel| !kernel.dirty));
-        let cell_count_before = old_cells.len();
-        let sigma_count_before = old_sigma.len();
+        let cell_count_before = layer.cells.len();
+        let sigma_count_before = layer.sigma.len();
 
         // External singletons keep the specialised V=0 path. Internal
         // contextual atoms have V>0 and use the general total-variance path.
         let point_single = presentation.len() == 1 && presentation[0].variance == 0.0;
+        // All fallible scratch reservation happens before persistent vectors
+        // are moved out of the layer.  Allocation failure therefore leaves the
+        // cognitive state untouched.
         if self.beta > 0.0 {
-            targets.reset(old_cells.len(), dimension, !point_single);
+            // Reserve for the largest population before moving either CELL or
+            // Sigma out of persistent state. Later scratch resets can then be
+            // allocation-free for this compartment, so allocation failure
+            // cannot strand cognition in a transient local vector.
+            targets.reset(
+                cell_count_before.max(sigma_count_before),
+                dimension,
+                !point_single,
+            )?;
         }
+        let mut old_cells = mem::take(&mut layer.cells);
+        let old_sigma = mem::take(&mut layer.sigma);
+        debug_assert!(old_cells.iter().all(|kernel| !kernel.dirty));
+        debug_assert!(old_sigma.iter().all(|kernel| !kernel.dirty));
         let mut cell_received = detailed.then(|| vec![0.0; old_cells.len()]);
-        let mut readout = Vec::new();
         let mut context_contributions: Vec<(usize, f64)> = Vec::new();
         let mut recognised_atoms = 0usize;
+        let mut recognition_count = 0usize;
 
-        // CONCERN -> ALLOCATE -> RECOGNISE from the frozen CELL state.
-        // The vertical context is built only from exact recognised snapshot
-        // values. Learning responsibilities never weight that geometry.
+        // CONCERN -> RECOGNISED KNOWLEDGE -> ALLOCATE from the frozen CELL
+        // state. Present knowledge is partitioned only by geometric CONCERN
+        // gain. Historical CELL support enters ALLOCATE only and therefore has
+        // no authority over the vertical context or external present readout.
         for (atom_index, atom) in presentation.iter().enumerate() {
             if atom.zero {
                 unknown.push(atom_index);
@@ -1673,18 +2153,15 @@ impl<S: Scalar> Auxein<S> {
             }
             let d0 = atom.norm2;
             concerned.clear();
-            let mut max_w = 0.0f64;
             let candidate_range = first_coordinate_candidate_range(&old_cells, atom.x[0], d0);
             for ci in candidate_range {
                 let (ok, gain, distance2) =
                     concern_scalar(&old_cells[ci], &atom.x, atom.variance, d0);
                 if ok {
-                    let weight = old_cells[ci].materialize_weight_at(cell_epoch, self.lambda);
                     concerned.push((ci, gain));
                     if point_single && self.beta > 0.0 {
                         targets.mark_single(ci, distance2);
                     }
-                    max_w = max_w.max(weight);
                 }
             }
             if concerned.is_empty() {
@@ -1693,57 +2170,87 @@ impl<S: Scalar> Auxein<S> {
             }
 
             recognised_atoms += 1;
-            for (ci, score) in &mut concerned {
-                *score *= old_cells[*ci].weight.to_f64() / max_w;
-            }
-            let denominator = stable_sum(concerned.iter().map(|&(_, score)| score));
-            for &(ci, score) in &concerned {
-                let cell = &old_cells[ci];
-                let rho = atom.r * score / denominator;
-                if self.beta > 0.0 {
-                    if point_single {
-                        targets.set_single_weight(ci, rho);
-                    } else {
-                        targets.add_atom(ci, atom_index, rho);
-                    }
+
+            // Quotient exact recognised CELL values by center without building
+            // an intermediate list.  Equal centers are contiguous in canonical
+            // CELL order and have the same CONCERN gain.
+            if space == Space::Geometry {
+                let unique_count = distinct_concerned_centers(&old_cells, &concerned);
+                recognition_count += unique_count;
+                if unique_count == 1 {
+                    context_contributions.push((concerned[0].0, atom.r));
+                } else {
+                    append_gain_weighted_knowledge(
+                        &old_cells,
+                        &concerned,
+                        atom.r,
+                        &mut context_contributions,
+                    );
                 }
-                if let Some(received) = &mut cell_received {
-                    received[ci] += rho;
-                }
-                readout.push(Recognition {
-                    universe: self.universe.clone(),
-                    local_input: atom.x.clone(),
-                    recognised: scalar_vec_to_f64(&cell.center),
-                });
             }
 
-            // R_s is the exact quotient of recognised snapshot values by
-            // center only (CELL dispersion/identity do not create concepts).
-            // Each distinct recognised value gets r_s / |R_s|; the resulting
-            // contextual mass is therefore exactly the recognised input mass.
-            let mut unique_count = 0usize;
-            let mut previous: Option<&[S]> = None;
-            for &(ci, _) in &concerned {
-                let center = old_cells[ci].center.as_slice();
-                if previous.is_none_or(|prev| prev != center) {
-                    unique_count += 1;
-                    previous = Some(center);
+            // Learning authority remains support-weighted ALLOCATE, but it has
+            // no observable role at eta=0 unless a detailed responsibility
+            // report was explicitly requested.  A single winner has rho=r
+            // exactly, independent of support history.
+            if self.beta > 0.0 || detailed {
+                if concerned.len() == 1 {
+                    let ci = concerned[0].0;
+                    let rho = atom.r;
+                    if self.beta > 0.0 {
+                        old_cells[ci].materialize_weight_at(cell_epoch, self.lambda);
+                        if point_single {
+                            targets.set_single_weight(ci, rho);
+                        } else {
+                            targets.add_atom(ci, atom_index, rho);
+                        }
+                    }
+                    if let Some(received) = &mut cell_received {
+                        received[ci] += rho;
+                    }
+                } else {
+                    normalize_allocate_scores(
+                        &mut concerned,
+                        &mut old_cells,
+                        cell_epoch,
+                        self.lambda,
+                    );
+                    let denominator = stable_sum(concerned.iter().map(|&(_, score)| score));
+                    if !(denominator > 0.0 && denominator.is_finite()) {
+                        return Err(Error::Inexecutable(
+                            "internal error: ALLOCATE normalization failed".into(),
+                        ));
+                    }
+                    for &(ci, score) in &concerned {
+                        let rho = atom.r * score / denominator;
+                        if self.beta > 0.0 {
+                            if point_single {
+                                targets.set_single_weight(ci, rho);
+                            } else {
+                                targets.add_atom(ci, atom_index, rho);
+                            }
+                        }
+                        if let Some(received) = &mut cell_received {
+                            received[ci] += rho;
+                        }
+                    }
                 }
-            }
-            debug_assert!(unique_count > 0);
-            let share = atom.r / unique_count as f64;
-            previous = None;
-            for &(ci, _) in &concerned {
-                let center = old_cells[ci].center.as_slice();
-                if previous.is_some_and(|prev| prev == center) {
-                    continue;
-                }
-                context_contributions.push((ci, share));
-                previous = Some(center);
             }
         }
 
-        let context = build_context_kernel(&old_cells, &context_contributions, dimension);
+        if space == Space::Geometry {
+            coalesce_knowledge_contributions(&old_cells, &mut context_contributions);
+        }
+        let context = if space == Space::Geometry {
+            build_context_kernel(&old_cells, &context_contributions, dimension)
+        } else {
+            None
+        };
+        let knowledge = if space == Space::Geometry {
+            build_output_knowledge(&old_cells, &context_contributions)
+        } else {
+            Vec::new()
+        };
 
         // Context is frozen from L^- before local learning. A singleton
         // context (V=0) has no vertical authority; neither does an exactly
@@ -1752,18 +2259,19 @@ impl<S: Scalar> Auxein<S> {
         let context_emitted = context
             .as_ref()
             .is_some_and(|kernel| kernel.variance > 0.0 && !zero_f64_vec(&kernel.center));
-        let output = if context_emitted {
-            let kernel = context.as_ref().expect("emitted context exists");
-            vec![Atom {
-                x: Arc::from(kernel.center.clone()),
-                r: kernel.weight,
-                variance: kernel.variance,
-                norm2: norm2(&kernel.center),
-                zero: false,
-            }]
-        } else {
-            Vec::new()
-        };
+        let output = context
+            .as_ref()
+            .filter(|kernel| kernel.variance > 0.0 && !zero_f64_vec(&kernel.center))
+            .map(|kernel| {
+                vec![Atom {
+                    x: Arc::from(kernel.center.clone()),
+                    r: kernel.weight,
+                    variance: kernel.variance,
+                    norm2: norm2(&kernel.center),
+                    zero: false,
+                }]
+            })
+            .unwrap_or_default();
 
         if self.beta == 0.0 {
             let unknown_atom_count = unknown.len();
@@ -1788,10 +2296,18 @@ impl<S: Scalar> Auxein<S> {
                     seed_requests: 0,
                     context_emitted,
                     output_atom_count: output.len(),
-                    output_mass: output.first().map_or(0.0, |a| a.r),
+                    output_mass: context.as_ref().map_or(0.0, |k| k.weight),
                     context_center: context.as_ref().map(|k| k.center.clone()),
                     context_variance: context.as_ref().map(|k| k.variance),
-                    recognition_count: readout.len(),
+                    recognition_count,
+                    knowledge_mass: stable_sum(knowledge.iter().map(|atom| atom.weight)),
+                    present_atom_count: if knowledge.is_empty() {
+                        0
+                    } else {
+                        let mass = stable_sum(knowledge.iter().map(|atom| atom.weight));
+                        knowledge.len() + usize::from(mass < 1.0)
+                    },
+                    present_mass: if knowledge.is_empty() { 0.0 } else { 1.0 },
                     cell_responsibility_mass: cell_received.unwrap_or_default(),
                 })
             } else {
@@ -1800,7 +2316,7 @@ impl<S: Scalar> Auxein<S> {
             return Ok(LayerResult {
                 output,
                 context,
-                readout,
+                knowledge,
                 seed_requests: Vec::new(),
                 transformations: Vec::new(),
                 report,
@@ -1808,9 +2324,7 @@ impl<S: Scalar> Auxein<S> {
         }
 
         let mut current_cells = old_cells;
-        let next_cell_epoch = cell_epoch
-            .checked_add(1)
-            .ok_or_else(|| Error::Invalid("cell decay epoch overflow".into()))?;
+        let next_cell_epoch = cell_epoch + 1;
         cell_decay_clock
             .epoch
             .store(next_cell_epoch, AtomicOrdering::Relaxed);
@@ -1851,75 +2365,147 @@ impl<S: Scalar> Auxein<S> {
             );
         }
 
-        targets.reset(old_sigma.len(), dimension, !point_single);
         let mut seed_requests = Vec::new();
-        for &atom_index in &unknown {
-            let atom = &presentation[atom_index];
-            if atom.zero {
-                continue;
-            }
-            let d0 = atom.norm2;
-            concerned.clear();
-            let mut max_w = 0.0f64;
-            let candidate_range = first_coordinate_candidate_range(&old_sigma, atom.x[0], d0);
-            for si in candidate_range {
-                let sigma = &old_sigma[si];
-                let (ok, gain, distance2) = concern_scalar(sigma, &atom.x, atom.variance, d0);
-                if ok {
-                    concerned.push((si, gain));
-                    if point_single {
-                        targets.mark_single(si, distance2);
+        let mut updated_sigma = old_sigma;
+
+        if unknown.is_empty() {
+            // Drop CELL-phase target indices before reusing the scratch for
+            // Sigma. No private kernel can be touched without an unknown atom.
+            targets.reset(0, dimension, false)?;
+        } else {
+            targets.reset(updated_sigma.len(), dimension, !point_single)?;
+            for &atom_index in &unknown {
+                let atom = &presentation[atom_index];
+                if atom.zero {
+                    continue;
+                }
+                let d0 = atom.norm2;
+                concerned.clear();
+                let candidate_range =
+                    first_coordinate_candidate_range(&updated_sigma, atom.x[0], d0);
+                for si in candidate_range {
+                    let sigma = &updated_sigma[si];
+                    let (ok, gain, distance2) = concern_scalar(sigma, &atom.x, atom.variance, d0);
+                    if ok {
+                        concerned.push((si, gain));
+                        if point_single {
+                            targets.mark_single(si, distance2);
+                        }
                     }
-                    max_w = max_w.max(sigma.weight.to_f64());
                 }
-            }
-            if !concerned.is_empty() {
-                for (si, score) in &mut concerned {
-                    *score *= old_sigma[*si].weight.to_f64() / max_w;
+                if concerned.is_empty() {
+                    seed_requests.push(Kernel64 {
+                        weight: self.beta * atom.r,
+                        center: atom.x.to_vec(),
+                        variance: atom.variance,
+                    });
+                    continue;
                 }
-                let denominator = stable_sum(concerned.iter().map(|&(_, score)| score));
-                for &(si, score) in &concerned {
-                    let tau = atom.r * score / denominator;
+
+                if concerned.len() == 1 {
+                    let si = concerned[0].0;
+                    updated_sigma[si].materialize_weight_at(cell_epoch, self.lambda);
                     if point_single {
-                        targets.set_single_weight(si, tau);
+                        targets.set_single_weight(si, atom.r);
                     } else {
-                        targets.add_atom(si, atom_index, tau);
+                        targets.add_atom(si, atom_index, atom.r);
+                    }
+                } else {
+                    normalize_allocate_scores(
+                        &mut concerned,
+                        &mut updated_sigma,
+                        cell_epoch,
+                        self.lambda,
+                    );
+                    let denominator = stable_sum(concerned.iter().map(|&(_, score)| score));
+                    if !(denominator > 0.0 && denominator.is_finite()) {
+                        return Err(Error::Inexecutable(
+                            "internal error: Sigma ALLOCATE normalization failed".into(),
+                        ));
+                    }
+                    for &(si, score) in &concerned {
+                        let tau = atom.r * score / denominator;
+                        if point_single {
+                            targets.set_single_weight(si, tau);
+                        } else {
+                            targets.add_atom(si, atom_index, tau);
+                        }
                     }
                 }
+            }
+
+            // Sigma shares the compartment clock with CELLs. Untouched private
+            // kernels keep their old epoch and are never multiplied merely for
+            // existing; only actual recipients are materialised and advanced.
+            if point_single {
+                targets.apply_single_cell_population(
+                    &mut updated_sigma,
+                    &presentation[0].x,
+                    self.beta,
+                    self.lambda,
+                    next_cell_epoch,
+                )?;
             } else {
-                seed_requests.push(Kernel64 {
-                    weight: self.beta * atom.r,
-                    center: atom.x.to_vec(),
-                    variance: atom.variance,
-                });
+                targets.apply_cell_population(
+                    &mut updated_sigma,
+                    presentation,
+                    self.beta,
+                    self.lambda,
+                    next_cell_epoch,
+                )?;
             }
         }
 
-        let mut updated_sigma = old_sigma;
-        if point_single {
-            targets.apply_single_population(
-                &mut updated_sigma,
-                &presentation[0].x,
-                self.beta,
-                self.lambda,
-            )?;
-        } else {
-            targets.apply_population(&mut updated_sigma, presentation, self.beta, self.lambda)?;
-        }
         let sigma_indices_stable = retain_touched_nonzero(&mut updated_sigma, &targets.touched);
-        let (updated_sigma, _) =
+        let (mut updated_sigma, sigma_order_stable) =
             coalesce_touched(updated_sigma, &targets.touched, sigma_indices_stable)?;
 
         let mut transformations = Vec::new();
         let mut promoted = Vec::new();
-        let mut remaining_sigma = Vec::new();
-        for kernel in updated_sigma {
-            if kernel.weight.to_f64() > self.beta && !zero_scalar_vec(&kernel.center) {
-                promoted.push(kernel);
+        if !targets.touched.is_empty() {
+            if sigma_order_stable {
+                let has_promotion = targets.touched.iter().copied().any(|index| {
+                    index < updated_sigma.len()
+                        && updated_sigma[index].weight.to_f64() > self.beta
+                        && !zero_scalar_vec(&updated_sigma[index].center)
+                });
+                if has_promotion {
+                    let mut remaining = Vec::with_capacity(updated_sigma.len());
+                    let mut touched_cursor = 0usize;
+                    for (index, kernel) in updated_sigma.into_iter().enumerate() {
+                        while touched_cursor < targets.touched.len()
+                            && targets.touched[touched_cursor] < index
+                        {
+                            touched_cursor += 1;
+                        }
+                        let touched = touched_cursor < targets.touched.len()
+                            && targets.touched[touched_cursor] == index;
+                        if touched
+                            && kernel.weight.to_f64() > self.beta
+                            && !zero_scalar_vec(&kernel.center)
+                        {
+                            promoted.push(kernel);
+                        } else {
+                            remaining.push(kernel);
+                        }
+                    }
+                    updated_sigma = remaining;
+                }
             } else {
-                remaining_sigma.push(kernel);
+                // Reordering destroys the old index map. This is a rare path;
+                // scan logical current weights rather than guessing provenance.
+                let mut remaining = Vec::with_capacity(updated_sigma.len());
+                for kernel in updated_sigma {
+                    if kernel.weight() > self.beta && !zero_scalar_vec(&kernel.center) {
+                        promoted.push(kernel);
+                    } else {
+                        remaining.push(kernel);
+                    }
+                }
+                updated_sigma = remaining;
             }
         }
+
         let promoted_count = promoted.len();
         if promoted_count > 0 {
             current_cells.extend(promoted.into_iter().map(|mut kernel| {
@@ -1943,35 +2529,97 @@ impl<S: Scalar> Auxein<S> {
         }
 
         let mut admissible_seeds = Vec::new();
-        if remaining_sigma.is_empty() && seed_requests.is_empty() {
+        if updated_sigma.is_empty() && seed_requests.is_empty() {
             layer.sigma.clear();
         } else {
             let changed_indices = &targets.changed;
+            let global_recheck =
+                !changed_indices.is_empty() || promoted_count > 0 || !sigma_order_stable;
 
-            let mut cleaned_sigma = Vec::new();
-            for mut sigma in remaining_sigma {
-                let candidate_range = first_coordinate_candidate_range(
-                    &current_cells,
-                    sigma.center[0].to_f64(),
-                    sigma.norm2,
-                );
-                let covered = if sigma.dirty {
-                    current_cells[candidate_range.clone()]
-                        .iter()
-                        .any(|cell| concern_kernel(cell, &sigma).0)
+            if global_recheck {
+                updated_sigma.retain_mut(|sigma| {
+                    let candidate_range = first_coordinate_candidate_range(
+                        &current_cells,
+                        sigma.center[0].to_f64(),
+                        sigma.norm2,
+                    );
+                    let sigma_center = scalar_vec_to_f64(&sigma.center);
+                    let sigma_variance = sigma.variance.to_f64();
+                    let sigma_norm2 = sigma.norm2;
+                    let covered = if sigma.dirty {
+                        current_cells[candidate_range].iter().any(|cell| {
+                            concern_raw_kernel(cell, &sigma_center, sigma_variance, sigma_norm2).0
+                        })
+                    } else {
+                        let first =
+                            changed_indices.partition_point(|&ci| ci < candidate_range.start);
+                        let last = changed_indices.partition_point(|&ci| ci < candidate_range.end);
+                        changed_indices[first..last].iter().any(|&ci| {
+                            concern_raw_kernel(
+                                &current_cells[ci],
+                                &sigma_center,
+                                sigma_variance,
+                                sigma_norm2,
+                            )
+                            .0
+                        })
+                    };
+                    if !covered {
+                        sigma.dirty = false;
+                    }
+                    !covered
+                });
+            } else if !targets.touched.is_empty() {
+                // No CELL geometry changed. Only Sigma kernels whose own
+                // geometry moved can have become covered; untouched kernels
+                // cannot change status. Fast path is independent of |Sigma|.
+                let mut covered = Vec::new();
+                for &index in &targets.touched {
+                    if index >= updated_sigma.len() || !updated_sigma[index].dirty {
+                        continue;
+                    }
+                    let sigma = &updated_sigma[index];
+                    let candidate_range = first_coordinate_candidate_range(
+                        &current_cells,
+                        sigma.center[0].to_f64(),
+                        sigma.norm2,
+                    );
+                    let sigma_center = scalar_vec_to_f64(&sigma.center);
+                    if current_cells[candidate_range].iter().any(|cell| {
+                        concern_raw_kernel(
+                            cell,
+                            &sigma_center,
+                            sigma.variance.to_f64(),
+                            sigma.norm2,
+                        )
+                        .0
+                    }) {
+                        covered.push(index);
+                    }
+                }
+                if covered.is_empty() {
+                    for &index in &targets.touched {
+                        if index < updated_sigma.len() {
+                            updated_sigma[index].dirty = false;
+                        }
+                    }
                 } else {
-                    let first = changed_indices.partition_point(|&ci| ci < candidate_range.start);
-                    let last = changed_indices.partition_point(|&ci| ci < candidate_range.end);
-                    changed_indices[first..last]
-                        .iter()
-                        .any(|&ci| concern_kernel(&current_cells[ci], &sigma).0)
-                };
-                if !covered {
-                    sigma.dirty = false;
-                    cleaned_sigma.push(sigma);
+                    let mut cursor = 0usize;
+                    let mut index = 0usize;
+                    updated_sigma.retain(|_| {
+                        let remove = cursor < covered.len() && covered[cursor] == index;
+                        if remove {
+                            cursor += 1;
+                        }
+                        index += 1;
+                        !remove
+                    });
+                    for kernel in &mut updated_sigma {
+                        kernel.dirty = false;
+                    }
                 }
             }
-            layer.sigma = cleaned_sigma;
+            layer.sigma = updated_sigma;
 
             for seed in coalesce_kernel64(seed_requests) {
                 let seed_norm2 = norm2(&seed.center);
@@ -2013,10 +2661,18 @@ impl<S: Scalar> Auxein<S> {
                 seed_requests: admissible_seeds.len(),
                 context_emitted,
                 output_atom_count: output.len(),
-                output_mass: output.first().map_or(0.0, |a| a.r),
+                output_mass: context.as_ref().map_or(0.0, |k| k.weight),
                 context_center: context.as_ref().map(|k| k.center.clone()),
                 context_variance: context.as_ref().map(|k| k.variance),
-                recognition_count: readout.len(),
+                recognition_count,
+                knowledge_mass: stable_sum(knowledge.iter().map(|atom| atom.weight)),
+                present_atom_count: if knowledge.is_empty() {
+                    0
+                } else {
+                    let mass = stable_sum(knowledge.iter().map(|atom| atom.weight));
+                    knowledge.len() + usize::from(mass < 1.0)
+                },
+                present_mass: if knowledge.is_empty() { 0.0 } else { 1.0 },
                 cell_responsibility_mass: cell_received.unwrap_or_default(),
             })
         } else {
@@ -2025,7 +2681,7 @@ impl<S: Scalar> Auxein<S> {
         Ok(LayerResult {
             output,
             context,
-            readout,
+            knowledge,
             seed_requests: admissible_seeds,
             transformations,
             report,
@@ -2085,17 +2741,26 @@ impl<S: Scalar> Auxein<S> {
         Ok(result)
     }
 
-    fn temporal_atom(&self, previous: &Kernel64, current: &Kernel64) -> Atom {
-        let mut center = Vec::with_capacity(self.dimension * 2);
+    fn temporal_atom(&self, previous: &Kernel64, current: &Kernel64) -> Result<Atom> {
+        let capacity = self
+            .dimension
+            .checked_mul(2)
+            .ok_or_else(|| Error::Inexecutable("temporal dimension overflow".into()))?;
+        let mut center = Vec::new();
+        center
+            .try_reserve(capacity)
+            .map_err(|_| Error::Inexecutable("cannot reserve temporal atom".into()))?;
         center.extend_from_slice(&previous.center);
         center.extend_from_slice(&current.center);
-        Atom {
-            x: Arc::from(center.clone()),
+        let norm2 = norm2(&center);
+        let zero = zero_f64_vec(&center);
+        Ok(Atom {
+            x: Arc::from(center),
             r: previous.weight * current.weight,
             variance: previous.variance + current.variance,
-            norm2: norm2(&center),
-            zero: zero_f64_vec(&center),
-        }
+            norm2,
+            zero,
+        })
     }
 
     fn project_previous(&self, context: &Kernel64) -> Result<Kernel<S>> {
@@ -2103,7 +2768,7 @@ impl<S: Scalar> Auxein<S> {
     }
 
     fn invalidate_previous(&mut self) {
-        if self.mode.temporal() {
+        if self.mode.predictive() {
             for layer in &mut self.layers {
                 layer.previous = None;
             }
@@ -2111,32 +2776,33 @@ impl<S: Scalar> Auxein<S> {
     }
 
     fn layer_has_cells(&self, layer: &Layer<S>) -> bool {
-        !layer.cells.is_empty() || (self.mode.temporal() && !layer.temporal_cells.is_empty())
+        !layer.cells.is_empty() || (self.mode.predictive() && !layer.temporal_cells.is_empty())
     }
 
     fn force_solvency(&mut self, transformations: &mut Vec<Transformation>) -> Result<()> {
-        if self.maintenance_units()? <= self.budget_units {
+        let mut simulated = self.maintenance_units()?;
+        if simulated <= self.budget_units {
             return Ok(());
         }
 
-        // Work in progress is discarded simultaneously in both spaces.
-        let removed_sigma: usize = self
-            .layers
-            .iter()
-            .map(|l| {
-                l.sigma.len()
-                    + if self.mode.temporal() {
-                        l.temporal_sigma.len()
-                    } else {
-                        0
-                    }
-            })
-            .sum();
+        // Work in progress is discarded simultaneously in both spaces.  Drop
+        // the allocations as well: forced contraction is a memory-pressure
+        // event, so retaining the high-water capacity would defeat its purpose
+        // in a long-running process.
+        let removed_sigma = self.layers.iter().fold(0usize, |total, layer| {
+            total
+                .saturating_add(layer.sigma.len())
+                .saturating_add(if self.mode.predictive() {
+                    layer.temporal_sigma.len()
+                } else {
+                    0
+                })
+        });
         if removed_sigma > 0 {
             for layer in &mut self.layers {
-                layer.sigma.clear();
-                if self.mode.temporal() {
-                    layer.temporal_sigma.clear();
+                layer.sigma = Vec::new();
+                if self.mode.predictive() {
+                    layer.temporal_sigma = Vec::new();
                 }
             }
             transformations.push(Transformation::ClearSigma {
@@ -2144,7 +2810,7 @@ impl<S: Scalar> Auxein<S> {
             });
         }
 
-        let mut trimmed = 0;
+        let mut trimmed = 0usize;
         while self.layers.len() > 1
             && self
                 .layers
@@ -2152,25 +2818,28 @@ impl<S: Scalar> Auxein<S> {
                 .is_some_and(|layer| !self.layer_has_cells(layer))
         {
             self.layers.pop();
-            trimmed += 1;
+            trimmed = trimmed.saturating_add(1);
         }
         if trimmed > 0 {
             transformations.push(Transformation::TrimLayers { count: trimmed });
         }
-        if self.maintenance_units()? <= self.budget_units {
+        simulated = self.maintenance_units()?;
+        if simulated <= self.budget_units {
             self.invalidate_previous();
             return Ok(());
         }
 
         // One K ordering spans geometric and temporal knowledge. Equal K is
-        // destroyed as a whole wave independently of its compartment.
+        // destroyed as a whole wave independently of its compartment.  Once
+        // K is sorted, material simulation is purely decremental: do not
+        // rescan every layer after every wave.
         let mut valued: Vec<(f64, usize, Space)> = Vec::new();
         let mut geometric_counts: Vec<usize> = self.layers.iter().map(|l| l.cells.len()).collect();
         let mut temporal_counts: Vec<usize> = self
             .layers
             .iter()
             .map(|l| {
-                if self.mode.temporal() {
+                if self.mode.predictive() {
                     l.temporal_cells.len()
                 } else {
                     0
@@ -2184,7 +2853,7 @@ impl<S: Scalar> Auxein<S> {
                     .iter()
                     .map(|cell| (Self::cell_value(cell), li, Space::Geometry)),
             );
-            if self.mode.temporal() {
+            if self.mode.predictive() {
                 valued.extend(
                     layer
                         .temporal_cells
@@ -2195,7 +2864,7 @@ impl<S: Scalar> Auxein<S> {
         }
         if valued.is_empty() {
             self.invalidate_previous();
-            if self.maintenance_units()? > self.budget_units {
+            if simulated > self.budget_units {
                 return Err(Error::Inexecutable(
                     "minimal Auxein state exceeds the execution budget".into(),
                 ));
@@ -2204,6 +2873,9 @@ impl<S: Scalar> Auxein<S> {
         }
         valued.sort_by(|a, b| a.0.total_cmp(&b.0));
 
+        let geometry_units = self.kernel_units()?;
+        let temporal_units = self.temporal_kernel_units()?;
+        let layer_units = self.layer_units()?;
         let mut active_layers = self.layers.len();
         let mut cutoff = None;
         let mut removed_cells = 0usize;
@@ -2214,55 +2886,53 @@ impl<S: Scalar> Auxein<S> {
             let mut stop = position;
             while stop < valued.len() && valued[stop].0 == k {
                 let (_, li, space) = valued[stop];
-                match space {
-                    Space::Geometry => geometric_counts[li] -= 1,
-                    Space::Temporal => temporal_counts[li] -= 1,
-                }
-                removed_cells += 1;
+                let units = match space {
+                    Space::Geometry => {
+                        geometric_counts[li] = geometric_counts[li].saturating_sub(1);
+                        geometry_units
+                    }
+                    Space::Temporal => {
+                        temporal_counts[li] = temporal_counts[li].saturating_sub(1);
+                        temporal_units
+                    }
+                };
+                simulated = simulated.checked_sub(units).ok_or_else(|| {
+                    Error::Invalid("material accounting underflow during contraction".into())
+                })?;
+                removed_cells = removed_cells.saturating_add(1);
                 stop += 1;
             }
-            waves += 1;
+            waves = waves.saturating_add(1);
             while active_layers > 1
                 && geometric_counts[active_layers - 1] == 0
                 && temporal_counts[active_layers - 1] == 0
             {
                 active_layers -= 1;
+                simulated = simulated.checked_sub(layer_units).ok_or_else(|| {
+                    Error::Invalid("material accounting underflow during layer trim".into())
+                })?;
             }
-            let geometric_total: usize = geometric_counts[..active_layers].iter().sum();
-            let temporal_total: usize = temporal_counts[..active_layers].iter().sum();
-            let simulated = self
-                .network_units()?
-                .checked_add(
-                    self.layer_units()?
-                        .checked_mul(active_layers as u64)
-                        .ok_or_else(|| Error::Invalid("material accounting overflow".into()))?,
-                )
-                .and_then(|n| {
-                    n.checked_add((geometric_total as u64).checked_mul(self.kernel_units().ok()?)?)
-                })
-                .and_then(|n| {
-                    n.checked_add(
-                        (temporal_total as u64).checked_mul(self.temporal_kernel_units().ok()?)?,
-                    )
-                })
-                .ok_or_else(|| Error::Invalid("material accounting overflow".into()))?;
             cutoff = Some(k);
             if simulated <= self.budget_units {
                 break;
             }
             position = stop;
         }
-        let cutoff = cutoff.unwrap_or(f64::INFINITY);
+        let cutoff = cutoff.ok_or_else(|| {
+            Error::Inexecutable("forced solvency found no removable knowledge".into())
+        })?;
 
         for layer in &mut self.layers {
             layer.cells.retain(|cell| Self::cell_value(cell) > cutoff);
-            if self.mode.temporal() {
+            layer.cells.shrink_to_fit();
+            if self.mode.predictive() {
                 layer
                     .temporal_cells
                     .retain(|cell| Self::cell_value(cell) > cutoff);
+                layer.temporal_cells.shrink_to_fit();
             }
         }
-        let mut trimmed_after = 0;
+        let mut trimmed_after = 0usize;
         while self.layers.len() > 1
             && self
                 .layers
@@ -2270,7 +2940,7 @@ impl<S: Scalar> Auxein<S> {
                 .is_some_and(|layer| !self.layer_has_cells(layer))
         {
             self.layers.pop();
-            trimmed_after += 1;
+            trimmed_after = trimmed_after.saturating_add(1);
         }
         transformations.push(Transformation::DestroyCells {
             count: removed_cells,
@@ -2296,7 +2966,6 @@ impl<S: Scalar> Auxein<S> {
         Ok(Summary {
             steps_seen: self.steps_seen,
             dimension: self.dimension,
-            universe: self.universe.to_string(),
             scalar: S::NAME,
             memory: self.memory.to_f64(),
             eta: self.eta.to_f64(),
@@ -2311,7 +2980,7 @@ impl<S: Scalar> Auxein<S> {
                 .layers
                 .iter()
                 .map(|l| {
-                    if self.mode.temporal() {
+                    if self.mode.predictive() {
                         l.temporal_cells.len()
                     } else {
                         0
@@ -2322,7 +2991,7 @@ impl<S: Scalar> Auxein<S> {
                 .layers
                 .iter()
                 .map(|l| {
-                    if self.mode.temporal() {
+                    if self.mode.predictive() {
                         l.temporal_sigma.len()
                     } else {
                         0
@@ -2332,7 +3001,7 @@ impl<S: Scalar> Auxein<S> {
             previous_context_per_layer: self
                 .layers
                 .iter()
-                .map(|l| self.mode.temporal() && l.previous.is_some())
+                .map(|l| self.mode.predictive() && l.previous.is_some())
                 .collect(),
             maintenance_units: maintenance,
             budget: self.budget_equivalent()?,
@@ -2342,20 +3011,19 @@ impl<S: Scalar> Auxein<S> {
         })
     }
 
-    pub fn export_json(&self) -> String {
-        let mut out = String::with_capacity(256 + self.maintenance_units().unwrap_or(0) as usize);
+    fn write_json_sink(&self, out: &mut impl JsonSink) {
         out.push('{');
-        out.push_str("\"format_version\":4,");
+        out.push_str("\"format_version\":5,");
         out.push_str("\"dimension\":");
         out.push_str(&self.dimension.to_string());
         out.push_str(",\"scalar\":");
-        json::quote(&mut out, S::NAME);
+        sink_quote(out, S::NAME);
         out.push_str(",\"memory\":");
-        push_float(&mut out, self.memory.to_f64());
+        push_float(out, self.memory.to_f64());
         out.push_str(",\"eta\":");
-        push_float(&mut out, self.eta.to_f64());
+        push_float(out, self.eta.to_f64());
         out.push_str(",\"mode\":");
-        json::quote(&mut out, self.mode.as_str());
+        sink_quote(out, self.mode.as_str());
         out.push_str(",\"steps_seen\":");
         out.push_str(&self.steps_seen.to_string());
         out.push_str(",\"layers\":[");
@@ -2364,17 +3032,17 @@ impl<S: Scalar> Auxein<S> {
                 out.push(',');
             }
             out.push_str("{\"sigma\":[");
-            write_kernel_list(&mut out, &layer.sigma);
+            write_kernel_list(out, &layer.sigma);
             out.push_str("],\"cells\":[");
-            write_kernel_list(&mut out, &layer.cells);
-            if self.mode.temporal() {
+            write_kernel_list(out, &layer.cells);
+            if self.mode.predictive() {
                 out.push_str("],\"temporal_sigma\":[");
-                write_kernel_list(&mut out, &layer.temporal_sigma);
+                write_kernel_list(out, &layer.temporal_sigma);
                 out.push_str("],\"temporal_cells\":[");
-                write_kernel_list(&mut out, &layer.temporal_cells);
+                write_kernel_list(out, &layer.temporal_cells);
                 out.push_str("],\"previous\":");
                 if let Some(previous) = &layer.previous {
-                    write_kernel(&mut out, previous);
+                    write_kernel(out, previous);
                 } else {
                     out.push_str("null");
                 }
@@ -2384,10 +3052,29 @@ impl<S: Scalar> Auxein<S> {
             }
         }
         out.push_str("]}");
+    }
+
+    pub fn export_json(&self) -> String {
+        let reserve = self
+            .maintenance_units()
+            .ok()
+            .and_then(|units| usize::try_from(units).ok())
+            .and_then(|units| units.checked_add(256))
+            .unwrap_or(256);
+        let mut out = String::with_capacity(reserve);
+        self.write_json_sink(&mut out);
         out
     }
 
-    pub fn from_json(json_text: &str, budget: Budget, universe: impl Into<String>) -> Result<Self> {
+    /// Stream canonical format_version=5 JSON without constructing a second
+    /// full in-memory copy of the persistent state.
+    pub fn write_json<W: IoWrite>(&self, writer: &mut W) -> Result<()> {
+        let mut sink = IoJsonSink::new(writer);
+        self.write_json_sink(&mut sink);
+        sink.finish()
+    }
+
+    pub fn from_json(json_text: &str, budget: Budget) -> Result<Self> {
         let parsed = json::parse(json_text)?;
         let state = ParsedState::from_json(parsed)?;
         if state.scalar != S::NAME {
@@ -2397,18 +3084,12 @@ impl<S: Scalar> Auxein<S> {
                 S::NAME
             )));
         }
-        Self::from_parsed_state(state, budget, universe.into())
+        Self::from_parsed_state(state, budget)
     }
 
-    fn from_parsed_state(state: ParsedState, budget: Budget, universe: String) -> Result<Self> {
-        let mut network = Self::new_with_mode(
-            state.dimension,
-            state.memory,
-            state.eta,
-            state.mode,
-            budget,
-            universe,
-        )?;
+    fn from_parsed_state(state: ParsedState, budget: Budget) -> Result<Self> {
+        let mut network =
+            Self::new_with_mode(state.dimension, state.memory, state.eta, state.mode, budget)?;
         if network.memory.to_f64() != state.memory || network.eta.to_f64() != state.eta {
             return Err(Error::Invalid(
                 "state.memory/state.eta are not exactly representable in state.scalar".into(),
@@ -2421,7 +3102,7 @@ impl<S: Scalar> Auxein<S> {
         }
         let mut layers = Vec::with_capacity(state.layers.len());
         for (li, layer) in state.layers.into_iter().enumerate() {
-            let sigma = load_kernel_list::<S>(
+            let mut sigma = load_kernel_list::<S>(
                 layer.sigma,
                 state.dimension,
                 &format!("layers[{li}].sigma"),
@@ -2432,12 +3113,15 @@ impl<S: Scalar> Auxein<S> {
                 &format!("layers[{li}].cells"),
             )?;
             let clock = Arc::new(DecayClock::new(0, network.lambda));
+            for kernel in &mut sigma {
+                kernel.bind_decay_clock(clock.clone(), 0);
+            }
             let mut cells = cells;
             for cell in &mut cells {
                 cell.bind_decay_clock(clock.clone(), 0);
             }
 
-            let temporal_sigma = load_kernel_list::<S>(
+            let mut temporal_sigma = load_kernel_list::<S>(
                 layer.temporal_sigma,
                 2 * state.dimension,
                 &format!("layers[{li}].temporal_sigma"),
@@ -2448,6 +3132,9 @@ impl<S: Scalar> Auxein<S> {
                 &format!("layers[{li}].temporal_cells"),
             )?;
             let temporal_clock = Arc::new(DecayClock::new(0, network.lambda));
+            for kernel in &mut temporal_sigma {
+                kernel.bind_decay_clock(temporal_clock.clone(), 0);
+            }
             let mut temporal_cells = temporal_cells;
             for cell in &mut temporal_cells {
                 cell.bind_decay_clock(temporal_clock.clone(), 0);
@@ -2492,7 +3179,7 @@ impl<S: Scalar> Auxein<S> {
                     "persistent geometric CELL/Sigma center must be nonzero".into(),
                 ));
             }
-            if self.mode.temporal() {
+            if self.mode.predictive() {
                 sort_kernels(&mut layer.temporal_cells);
                 sort_kernels(&mut layer.temporal_sigma);
                 assert_unique_geometry(
@@ -2557,17 +3244,8 @@ impl Network {
         memory: f64,
         eta: f64,
         budget: Budget,
-        universe: impl Into<String>,
     ) -> Result<Self> {
-        Self::new_with_mode(
-            scalar,
-            dimension,
-            memory,
-            eta,
-            Mode::Geometry,
-            budget,
-            universe,
-        )
+        Self::new_with_mode(scalar, dimension, memory, eta, Mode::Geometry, budget)
     }
 
     pub fn new_with_mode(
@@ -2577,31 +3255,24 @@ impl Network {
         eta: f64,
         mode: Mode,
         budget: Budget,
-        universe: impl Into<String>,
     ) -> Result<Self> {
-        let universe = universe.into();
         match scalar {
             "f32" => Ok(Self::F32(Auxein::new_with_mode(
-                dimension, memory, eta, mode, budget, universe,
+                dimension, memory, eta, mode, budget,
             )?)),
             "f64" => Ok(Self::F64(Auxein::new_with_mode(
-                dimension, memory, eta, mode, budget, universe,
+                dimension, memory, eta, mode, budget,
             )?)),
             _ => Err(Error::Invalid("scalar must be 'f32' or 'f64'".into())),
         }
     }
 
-    pub fn from_json(json_text: &str, budget: Budget, universe: impl Into<String>) -> Result<Self> {
+    pub fn from_json(json_text: &str, budget: Budget) -> Result<Self> {
         let parsed = json::parse(json_text)?;
         let state = ParsedState::from_json(parsed)?;
-        let universe = universe.into();
         match state.scalar.as_str() {
-            "f32" => Ok(Self::F32(Auxein::<f32>::from_parsed_state(
-                state, budget, universe,
-            )?)),
-            "f64" => Ok(Self::F64(Auxein::<f64>::from_parsed_state(
-                state, budget, universe,
-            )?)),
+            "f32" => Ok(Self::F32(Auxein::<f32>::from_parsed_state(state, budget)?)),
+            "f64" => Ok(Self::F64(Auxein::<f64>::from_parsed_state(state, budget)?)),
             _ => Err(Error::Invalid("state.scalar must be 'f32' or 'f64'".into())),
         }
     }
@@ -2610,6 +3281,64 @@ impl Network {
         match self {
             Self::F32(n) => n.step(presentation, detailed),
             Self::F64(n) => n.step(presentation, detailed),
+        }
+    }
+
+    pub fn step_weighted(
+        &mut self,
+        presentation: &[InputAtom],
+        detailed: bool,
+    ) -> Result<StepReport> {
+        match self {
+            Self::F32(n) => n.step_weighted(presentation, detailed),
+            Self::F64(n) => n.step_weighted(presentation, detailed),
+        }
+    }
+
+    pub fn begin_sequence(&mut self, resume: bool) -> Result<()> {
+        match self {
+            Self::F32(n) => n.begin_sequence(resume),
+            Self::F64(n) => n.begin_sequence(resume),
+        }
+    }
+
+    pub fn end_sequence(&mut self) -> Result<()> {
+        match self {
+            Self::F32(n) => n.end_sequence(),
+            Self::F64(n) => n.end_sequence(),
+        }
+    }
+
+    pub fn sequence_step(
+        &mut self,
+        presentation: &[Vec<f64>],
+        detailed: bool,
+    ) -> Result<StepReport> {
+        match self {
+            Self::F32(n) => n.sequence_step(presentation, detailed),
+            Self::F64(n) => n.sequence_step(presentation, detailed),
+        }
+    }
+
+    pub fn sequence_step_weighted(
+        &mut self,
+        presentation: &[InputAtom],
+        detailed: bool,
+    ) -> Result<StepReport> {
+        match self {
+            Self::F32(n) => n.sequence_step_weighted(presentation, detailed),
+            Self::F64(n) => n.sequence_step_weighted(presentation, detailed),
+        }
+    }
+
+    pub fn consume(
+        &mut self,
+        present_family: &[OutputPresentation],
+        detailed: bool,
+    ) -> Result<Vec<StepReport>> {
+        match self {
+            Self::F32(n) => n.consume(present_family, detailed),
+            Self::F64(n) => n.consume(present_family, detailed),
         }
     }
 
@@ -2634,10 +3363,31 @@ impl Network {
         }
     }
 
+    pub fn transient_memory_capacity_bytes(&self) -> usize {
+        match self {
+            Self::F32(n) => n.transient_memory_capacity_bytes(),
+            Self::F64(n) => n.transient_memory_capacity_bytes(),
+        }
+    }
+
+    pub fn compact_transient_memory(&mut self) {
+        match self {
+            Self::F32(n) => n.compact_transient_memory(),
+            Self::F64(n) => n.compact_transient_memory(),
+        }
+    }
+
     pub fn export_json(&self) -> String {
         match self {
             Self::F32(n) => n.export_json(),
             Self::F64(n) => n.export_json(),
+        }
+    }
+
+    pub fn write_json<W: IoWrite>(&self, writer: &mut W) -> Result<()> {
+        match self {
+            Self::F32(n) => n.write_json(writer),
+            Self::F64(n) => n.write_json(writer),
         }
     }
 }
@@ -2721,7 +3471,7 @@ impl ParsedState {
                 Mode::Geometry => {
                     exact_keys(&layer, &["sigma", "cells"], &format!("state.layers[{li}]"))?
                 }
-                Mode::Temporal | Mode::Predictive => exact_keys(
+                Mode::Predictive => exact_keys(
                     &layer,
                     &[
                         "sigma",
@@ -2745,7 +3495,7 @@ impl ParsedState {
             )?;
             let (temporal_sigma, temporal_cells, previous) = match mode {
                 Mode::Geometry => (Vec::new(), Vec::new(), None),
-                Mode::Temporal | Mode::Predictive => {
+                Mode::Predictive => {
                     let temporal_sigma = parse_kernel_list(
                         take_array(&mut layer, "temporal_sigma", "temporal_sigma")?,
                         2 * dimension,
@@ -2919,42 +3669,39 @@ fn first_coordinate_candidate_range<S: Scalar>(
     x0: f64,
     d0: f64,
 ) -> std::ops::Range<usize> {
-    if kernels.len() <= 1 || !d0.is_finite() || d0 <= 0.0 {
+    if kernels.len() <= 8 || !d0.is_finite() || d0 <= 0.0 {
         return 0..kernels.len();
     }
 
-    // Kernels are already in canonical lexicographic center order. Any
-    // concerned kernel must satisfy (x0 - C0)^2 < ||x||^2 because its full
-    // squared distance is required to be < min(||x||^2, ||C||^2 + V).
-    // Locate x0, then expand only while this necessary condition can hold.
+    // Kernels are in canonical lexicographic center order.  The necessary
+    // first-coordinate condition is monotone on either side of x0, so both
+    // bounds are binary searches using the exact same squared comparison as
+    // the full CONCERN test.
     let split = kernels.partition_point(|kernel| kernel.center[0].to_f64() < x0);
-    let mut start = split;
-    while start > 0 {
-        let delta = x0 - kernels[start - 1].center[0].to_f64();
-        if delta * delta >= d0 {
-            break;
-        }
-        start -= 1;
-    }
-    let mut end = split;
-    while end < kernels.len() {
-        let delta = kernels[end].center[0].to_f64() - x0;
-        if delta * delta >= d0 {
-            break;
-        }
-        end += 1;
-    }
-    start..end
+    let start = kernels[..split].partition_point(|kernel| {
+        let delta = x0 - kernel.center[0].to_f64();
+        delta * delta >= d0
+    });
+    let right = kernels[split..].partition_point(|kernel| {
+        let delta = kernel.center[0].to_f64() - x0;
+        delta * delta < d0
+    });
+    start..split + right
 }
 
-fn point_concern_scalar<S: Scalar>(current: &[f64], source: &[S]) -> bool {
+fn point_relative_gain_scalar<S: Scalar>(
+    current: &[f64],
+    current2: f64,
+    current_nonzero: bool,
+    source: &[S],
+) -> Option<f64> {
     debug_assert_eq!(current.len(), source.len());
-    let current2 = norm2(current);
     let source2 = norm2_scalar(source);
-    let current_nonzero = current.iter().any(|&x| x != 0.0);
     let source_nonzero = source.iter().any(|&x| x.to_f64() != 0.0);
     let extreme = !current2.is_finite()
         || !source2.is_finite()
+        || current2.is_subnormal()
+        || source2.is_subnormal()
         || (current2 == 0.0 && current_nonzero)
         || (source2 == 0.0 && source_nonzero);
 
@@ -2967,7 +3714,7 @@ fn point_concern_scalar<S: Scalar>(current: &[f64], source: &[S]) -> bool {
             scale = scale.max(x.to_f64().abs());
         }
         if scale == 0.0 {
-            return false;
+            return None;
         }
         let current_scaled = stable_sum(current.iter().map(|&x| {
             let y = x / scale;
@@ -2981,14 +3728,20 @@ fn point_concern_scalar<S: Scalar>(current: &[f64], source: &[S]) -> bool {
             let d = a / scale - b.to_f64() / scale;
             d * d
         }));
-        return distance_scaled < current_scaled && distance_scaled < source_scaled;
+        if !(distance_scaled < current_scaled && distance_scaled < source_scaled) {
+            return None;
+        }
+        return Some((current_scaled - distance_scaled) / current_scaled);
     }
 
     let distance2 = stable_sum(current.iter().zip(source).map(|(&a, &b)| {
         let d = a - b.to_f64();
         d * d
     }));
-    distance2 < current2 && distance2 < source2
+    if !(distance2 < current2 && distance2 < source2) {
+        return None;
+    }
+    Some((current2 - distance2) / current2)
 }
 
 fn concern_scalar<S: Scalar>(
@@ -3051,10 +3804,17 @@ fn concern_scalar<S: Scalar>(
         return (ok, x2 - geometric, distance2);
     }
 
-    // The first canonical bound is D_i < D_0 with the same incoming V on
-    // both sides. Geometrically this still requires ||x-C||^2 < ||x||^2,
-    // which remains a safe early-stop criterion. The second bound compares
-    // the full incoming contextual dispersion.
+    // A concerned center necessarily satisfies ||C|| < 2||x||.  Rejecting
+    // impossible energetic centers before touching D coordinates protects the
+    // degenerate case where many kernels share the same indexed coordinate.
+    let norm_limit = 4.0 * d0_center;
+    if norm_limit.is_finite() && kernel.norm2 >= norm_limit {
+        return (false, 0.0, 0.0);
+    }
+
+    // D_i < D_0 contains the same incoming variance on both sides, so cancel
+    // it before arithmetic.  This avoids a false `inf < inf` at huge finite
+    // variances and is exactly the canonical inequality.
     let mut sum = 0.0;
     let mut correction = 0.0;
     for (&a, &b) in x.iter().zip(&kernel.center) {
@@ -3066,19 +3826,37 @@ fn concern_scalar<S: Scalar>(
         compensated_add(&mut sum, &mut correction, term);
     }
     let geometric = compensated_finish(sum, correction);
-    let da = structural_zero(geometric + input_variance);
-    let d0 = structural_zero(d0_center + input_variance);
-    let ok = da < d0 && da < kernel.norm2 + kernel.variance.to_f64();
+    if geometric.partial_cmp(&d0_center) != Some(Ordering::Less) {
+        return (false, d0_center - geometric, geometric);
+    }
+    let ok = positive_sum_lt(
+        geometric,
+        input_variance,
+        kernel.norm2,
+        kernel.variance.to_f64(),
+    );
     (ok, d0_center - geometric, geometric)
 }
 
-fn concern_kernel<S: Scalar>(kernel: &Kernel<S>, x: &Kernel<S>) -> (bool, f64) {
-    concern_raw_kernel(
-        kernel,
-        &scalar_vec_to_f64(&x.center),
-        x.variance.to_f64(),
-        x.norm2,
-    )
+#[inline]
+fn positive_sum_lt(a: f64, b: f64, c: f64, d: f64) -> bool {
+    debug_assert!(a >= 0.0 && b >= 0.0 && c >= 0.0 && d >= 0.0);
+    if c.is_infinite() || d.is_infinite() {
+        return !(a.is_infinite() || b.is_infinite());
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return false;
+    }
+    let left = a + b;
+    let right = c + d;
+    if left.is_finite() && right.is_finite() {
+        return left < right;
+    }
+    let scale = a.max(b).max(c).max(d);
+    if scale == 0.0 {
+        return false;
+    }
+    a / scale + b / scale < c / scale + d / scale
 }
 
 fn concern_raw_kernel<S: Scalar>(
@@ -3122,6 +3900,251 @@ fn coalesce_atoms(mut atoms: Vec<Atom>) -> Vec<Atom> {
     out
 }
 
+fn coalesce_output_presentation(mut atoms: Vec<OutputAtom>) -> Vec<OutputAtom> {
+    atoms.sort_by(|a, b| {
+        cmp_vec(&a.center, &b.center).then_with(|| a.variance.total_cmp(&b.variance))
+    });
+    if !atoms
+        .windows(2)
+        .any(|pair| pair[0].center == pair[1].center && pair[0].variance == pair[1].variance)
+    {
+        return atoms;
+    }
+    let mut out = Vec::with_capacity(atoms.len());
+    let mut i = 0;
+    while i < atoms.len() {
+        let center = atoms[i].center.clone();
+        let variance = atoms[i].variance;
+        let mut j = i + 1;
+        while j < atoms.len() && atoms[j].center == center && atoms[j].variance == variance {
+            j += 1;
+        }
+        let weight = stable_sum(atoms[i..j].iter().map(|atom| atom.weight));
+        if weight > 0.0 {
+            out.push(OutputAtom {
+                weight,
+                center,
+                variance,
+            });
+        }
+        i = j;
+    }
+    out
+}
+
+fn complete_output_presentation(
+    mut atoms: Vec<OutputAtom>,
+    dimension: usize,
+) -> Result<OutputPresentation> {
+    let already_canonical = atoms
+        .windows(2)
+        .all(|pair| output_geometry_cmp(&pair[0], &pair[1]) == Ordering::Less);
+    if !already_canonical {
+        atoms = coalesce_output_presentation(atoms);
+    }
+    let total = stable_sum(atoms.iter().map(|atom| atom.weight));
+    let mut remainder = 1.0 - total;
+    if remainder < 0.0 {
+        if remainder.abs() <= 8.0 * f64::EPSILON {
+            remainder = 0.0;
+        } else {
+            return Err(Error::Inexecutable(format!(
+                "internal error: output presentation mass exceeds one (total={total:.17e})"
+            )));
+        }
+    }
+    if remainder > 0.0 {
+        let zero = OutputAtom {
+            weight: remainder,
+            center: vec![0.0; dimension],
+            variance: 0.0,
+        };
+        match atoms.binary_search_by(|atom| output_geometry_cmp(atom, &zero)) {
+            Ok(index) => atoms[index].weight += remainder,
+            Err(index) => atoms.insert(index, zero),
+        }
+    }
+    Ok(atoms)
+}
+
+fn distinct_concerned_centers<S: Scalar>(cells: &[Kernel<S>], concerned: &[(usize, f64)]) -> usize {
+    let mut count = 0usize;
+    let mut previous: Option<&[S]> = None;
+    for &(index, _) in concerned {
+        let center = cells[index].center.as_slice();
+        if previous.is_none_or(|value| value != center) {
+            count += 1;
+            previous = Some(center);
+        }
+    }
+    count
+}
+
+fn append_gain_weighted_knowledge<S: Scalar>(
+    cells: &[Kernel<S>],
+    concerned: &[(usize, f64)],
+    atom_mass: f64,
+    out: &mut Vec<(usize, f64)>,
+) {
+    let mut gain_scale = 0.0f64;
+    let mut previous: Option<&[S]> = None;
+    for &(index, gain) in concerned {
+        let center = cells[index].center.as_slice();
+        if previous.is_none_or(|value| value != center) {
+            gain_scale = gain_scale.max(gain);
+            previous = Some(center);
+        }
+    }
+    debug_assert!(gain_scale > 0.0 && gain_scale.is_finite());
+
+    let mut denominator = 0.0;
+    let mut correction = 0.0;
+    previous = None;
+    for &(index, gain) in concerned {
+        let center = cells[index].center.as_slice();
+        if previous.is_none_or(|value| value != center) {
+            compensated_add(&mut denominator, &mut correction, gain / gain_scale);
+            previous = Some(center);
+        }
+    }
+    denominator = compensated_finish(denominator, correction);
+
+    let mut assigned_sum = 0.0;
+    let mut assigned_correction = 0.0;
+    let mut seen = 0usize;
+    let unique_count = distinct_concerned_centers(cells, concerned);
+    previous = None;
+    for &(index, gain) in concerned {
+        let center = cells[index].center.as_slice();
+        if previous.is_some_and(|value| value == center) {
+            continue;
+        }
+        seen += 1;
+        let weight = if seen == unique_count {
+            (atom_mass - compensated_finish(assigned_sum, assigned_correction)).max(0.0)
+        } else {
+            let weight = atom_mass * (gain / gain_scale) / denominator;
+            compensated_add(&mut assigned_sum, &mut assigned_correction, weight);
+            weight
+        };
+        if weight > 0.0 {
+            out.push((index, weight));
+        }
+        previous = Some(center);
+    }
+}
+
+fn normalize_allocate_scores<S: Scalar>(
+    concerned: &mut [(usize, f64)],
+    cells: &mut [Kernel<S>],
+    epoch: u64,
+    lambda: f64,
+) {
+    let mut max_gain = 0.0f64;
+    let mut max_weight = 0.0f64;
+    for &(index, gain) in concerned.iter() {
+        max_gain = max_gain.max(gain);
+        max_weight = max_weight.max(cells[index].materialize_weight_at(epoch, lambda));
+    }
+    for (index, score) in concerned.iter_mut() {
+        let weight = cells[*index].weight.to_f64();
+        *score = (*score / max_gain) * (weight / max_weight);
+    }
+    let denominator = stable_sum(concerned.iter().map(|&(_, score)| score));
+    if denominator > 0.0 && denominator.is_finite() {
+        return;
+    }
+    normalize_allocate_scores_extreme(concerned, cells);
+}
+
+#[cold]
+#[inline(never)]
+fn normalize_allocate_scores_extreme<S: Scalar>(
+    concerned: &mut [(usize, f64)],
+    cells: &[Kernel<S>],
+) {
+    let mut max_log = f64::NEG_INFINITY;
+    for &(index, gain) in concerned.iter() {
+        max_log = max_log.max(gain.ln() + cells[index].weight.to_f64().ln());
+    }
+    for (index, score) in concerned.iter_mut() {
+        *score = (score.ln() + cells[*index].weight.to_f64().ln() - max_log).exp();
+    }
+}
+
+#[inline]
+fn saturating_positive_scalar<S: Scalar>(value: f64) -> S {
+    let min = S::min_positive().to_f64();
+    let max = S::max_finite().to_f64();
+    let bounded = if value.is_nan() || value.is_infinite() || value > max {
+        max
+    } else if value <= 0.0 {
+        min
+    } else {
+        value.max(min)
+    };
+    <S as sealed::Sealed>::from_finite(bounded)
+}
+fn coalesce_knowledge_contributions<S: Scalar>(
+    cells: &[Kernel<S>],
+    contributions: &mut Vec<(usize, f64)>,
+) {
+    if contributions.len() <= 1 {
+        return;
+    }
+    contributions.sort_unstable_by_key(|&(index, _)| index);
+    let mut write = 0usize;
+    let mut read = 0usize;
+    while read < contributions.len() {
+        let first_index = contributions[read].0;
+        let center = cells[first_index].center.as_slice();
+        let mut end = read + 1;
+        while end < contributions.len() && cells[contributions[end].0].center.as_slice() == center {
+            end += 1;
+        }
+        let weight = stable_sum(contributions[read..end].iter().map(|&(_, weight)| weight));
+        contributions[write] = (first_index, weight);
+        write += 1;
+        read = end;
+    }
+    contributions.truncate(write);
+}
+
+fn build_output_knowledge<S: Scalar>(
+    cells: &[Kernel<S>],
+    contributions: &[(usize, f64)],
+) -> Vec<OutputAtom> {
+    contributions
+        .iter()
+        .filter(|&&(_, weight)| weight > 0.0)
+        .map(|&(index, weight)| OutputAtom {
+            weight,
+            center: scalar_vec_to_f64(&cells[index].center),
+            variance: 0.0,
+        })
+        .collect()
+}
+
+fn output_geometry_cmp(a: &OutputAtom, b: &OutputAtom) -> Ordering {
+    cmp_vec(&a.center, &b.center).then_with(|| a.variance.total_cmp(&b.variance))
+}
+
+fn output_atom_cmp(a: &OutputAtom, b: &OutputAtom) -> Ordering {
+    cmp_vec(&a.center, &b.center)
+        .then_with(|| a.variance.total_cmp(&b.variance))
+        .then_with(|| a.weight.total_cmp(&b.weight))
+}
+
+fn output_presentation_cmp(a: &OutputPresentation, b: &OutputPresentation) -> Ordering {
+    for (left, right) in a.iter().zip(b) {
+        let order = output_atom_cmp(left, right);
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 fn build_context_kernel<S: Scalar>(
     cells: &[Kernel<S>],
     contributions: &[(usize, f64)],
@@ -3159,19 +4182,29 @@ fn build_context_kernel<S: Scalar>(
     }
 
     for &(index, w) in contributions {
-        terms.clear();
-        terms.extend(cells[index].center.iter().zip(&center).map(|(&x, &c)| {
-            let d = x.to_f64() - c;
-            d * d
-        }));
-        let distance2 = orderless_sum(&terms, &mut partials);
+        let distance2 = robust_distance2_scalar_f64(&cells[index].center, &center);
         variance_terms.push(w * distance2);
     }
-    let variance = structural_zero(orderless_sum(&variance_terms, &mut partials) / weight);
+    let raw_variance = orderless_sum(&variance_terms, &mut partials) / weight;
+    let scalar_max = S::max_finite().to_f64();
+    let variance = if raw_variance.is_nan() || raw_variance < 0.0 {
+        // All terms are nonnegative, so NaN here can only be a representational
+        // overflow/cancellation artifact.  Preserve a finite persistent state.
+        scalar_max
+    } else if !raw_variance.is_finite() || raw_variance > scalar_max {
+        scalar_max
+    } else if raw_variance < S::min_positive().to_f64() {
+        // We already proved above that at least two exact centers differ.  The
+        // mathematical variance is therefore strictly positive even when its
+        // host value is nonzero but would project to zero in persistent S.
+        S::min_positive().to_f64()
+    } else {
+        raw_variance
+    };
     Some(Kernel64 {
         weight,
         center,
-        variance,
+        variance: structural_zero(variance),
     })
 }
 
@@ -3286,10 +4319,8 @@ fn coalesce_dirty<S: Scalar>(mut kernels: Vec<Kernel<S>>) -> Result<Vec<Kernel<S
             dirty |= kernels[j].dirty;
             j += 1;
         }
-        let mut weight = S::from_f64(stable_sum(kernels[i..j].iter().map(Kernel::weight)))?;
-        if weight.to_f64() <= 0.0 {
-            weight = S::min_positive();
-        }
+        let weight =
+            saturating_positive_scalar::<S>(stable_sum(kernels[i..j].iter().map(Kernel::weight)));
         let norm2 = kernels[i].norm2;
         out.push(Kernel {
             weight,
@@ -3313,6 +4344,84 @@ fn kernel_geometry_cmp<S: Scalar>(a: &Kernel<S>, b: &Kernel<S>) -> Ordering {
         .then_with(|| a.variance.to_f64().total_cmp(&b.variance.to_f64()))
 }
 
+fn count_new_geometries<S: Scalar>(existing: &[Kernel<S>], additions: &[Kernel<S>]) -> usize {
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut new_count = 0usize;
+    while j < additions.len() {
+        while i < existing.len()
+            && kernel_geometry_cmp(&existing[i], &additions[j]) == Ordering::Less
+        {
+            i += 1;
+        }
+        if i == existing.len()
+            || kernel_geometry_cmp(&existing[i], &additions[j]) != Ordering::Equal
+        {
+            new_count += 1;
+        }
+        j += 1;
+    }
+    new_count
+}
+
+fn merge_projected<S: Scalar>(
+    existing: Vec<Kernel<S>>,
+    additions: Vec<Kernel<S>>,
+    clock: Arc<DecayClock>,
+    epoch: u64,
+) -> Result<Vec<Kernel<S>>> {
+    let capacity = existing.len().saturating_add(additions.len());
+    let mut out = Vec::new();
+    out.try_reserve(capacity)
+        .map_err(|_| Error::Inexecutable("cannot reserve Sigma growth memory".into()))?;
+    let mut left = existing.into_iter().peekable();
+    let mut right = additions.into_iter().peekable();
+    loop {
+        match (left.peek(), right.peek()) {
+            (Some(a), Some(b)) => match kernel_geometry_cmp(a, b) {
+                Ordering::Less => out.push(left.next().ok_or_else(|| {
+                    Error::Inexecutable("internal Sigma merge state is invalid".into())
+                })?),
+                Ordering::Greater => {
+                    let mut kernel = right.next().ok_or_else(|| {
+                        Error::Inexecutable("internal Sigma merge state is invalid".into())
+                    })?;
+                    kernel.bind_decay_clock(clock.clone(), epoch);
+                    out.push(kernel);
+                }
+                Ordering::Equal => {
+                    let mut a = left.next().ok_or_else(|| {
+                        Error::Inexecutable("internal Sigma merge state is invalid".into())
+                    })?;
+                    let b = right.next().ok_or_else(|| {
+                        Error::Inexecutable("internal Sigma merge state is invalid".into())
+                    })?;
+                    a.materialize_weight_at(epoch, clock.lambda());
+                    let weight = stable_sum([a.weight.to_f64(), b.weight.to_f64()]);
+                    a.weight = saturating_positive_scalar::<S>(weight);
+                    a.decay_epoch = epoch;
+                    a.bind_decay_clock(clock.clone(), epoch);
+                    a.dirty = false;
+                    out.push(a);
+                }
+            },
+            (Some(_), None) => {
+                out.extend(left);
+                break;
+            }
+            (None, Some(_)) => {
+                for mut kernel in right {
+                    kernel.bind_decay_clock(clock.clone(), epoch);
+                    out.push(kernel);
+                }
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+    Ok(out)
+}
+
 fn coalesce_projected<S: Scalar>(mut kernels: Vec<Kernel<S>>) -> Result<Vec<Kernel<S>>> {
     sort_kernels(&mut kernels);
     if !kernels
@@ -3330,12 +4439,9 @@ fn coalesce_projected<S: Scalar>(mut kernels: Vec<Kernel<S>>) -> Result<Vec<Kern
         while j < kernels.len() && kernels[j].center == center && kernels[j].variance == variance {
             j += 1;
         }
-        let mut weight = S::from_f64(stable_sum(
+        let weight = saturating_positive_scalar::<S>(stable_sum(
             kernels[i..j].iter().map(|kernel| kernel.weight.to_f64()),
-        ))?;
-        if weight.to_f64() <= 0.0 {
-            weight = S::min_positive();
-        }
+        ));
         let norm2 = kernels[i].norm2;
         out.push(Kernel {
             weight,
@@ -3368,7 +4474,22 @@ fn assert_unique_geometry<S: Scalar>(kernels: &[Kernel<S>], label: &str) -> Resu
 
 #[inline]
 fn compensated_add(sum: &mut f64, correction: &mut f64, x: f64) {
+    // Neumaier compensation assumes finite arithmetic.  Positive overflow is
+    // a legitimate result for several structural sums (notably squared norms)
+    // and must remain +inf rather than being turned into NaN by `inf - inf`.
+    // Signed infinities or NaN are propagated explicitly; behavioral callers
+    // either reject them or switch to their homogeneous fallback.
+    if !sum.is_finite() || !x.is_finite() {
+        *sum += x;
+        *correction = 0.0;
+        return;
+    }
     let next = *sum + x;
+    if !next.is_finite() {
+        *sum = next;
+        *correction = 0.0;
+        return;
+    }
     if sum.abs() >= x.abs() {
         *correction += (*sum - next) + x;
     } else {
@@ -3426,14 +4547,79 @@ fn orderless_sum(values: &[f64], partials: &mut Vec<f64>) -> f64 {
 }
 
 fn norm2(v: &[f64]) -> f64 {
-    stable_sum(v.iter().map(|x| x * x))
+    squared_norm_iter(v.iter().copied())
 }
 
 fn norm2_scalar<S: Scalar>(v: &[S]) -> f64 {
-    stable_sum(v.iter().map(|x| {
-        let x = x.to_f64();
-        x * x
-    }))
+    squared_norm_iter(v.iter().map(|&x| x.to_f64()))
+}
+
+#[inline]
+fn squared_norm_iter<I: IntoIterator<Item = f64>>(values: I) -> f64 {
+    let mut sum = 0.0;
+    let mut correction = 0.0;
+    for value in values {
+        let term = value * value;
+        if term.is_infinite() {
+            return f64::INFINITY;
+        }
+        compensated_add(&mut sum, &mut correction, term);
+        if sum.is_infinite() {
+            return f64::INFINITY;
+        }
+    }
+    compensated_finish(sum, correction)
+}
+
+// Squared Euclidean distance for finite coordinates.  The normal path avoids
+// extra passes.  If a square overflows, scale homogeneously; if the true
+// positive value lies below binary64, MIN_POSITIVE preserves the exact
+// topological fact "distance > 0" without introducing a behavioral epsilon.
+fn robust_distance2_scalar_f64<S: Scalar>(a: &[S], b: &[f64]) -> f64 {
+    let mut sum = 0.0;
+    let mut correction = 0.0;
+    let mut any_nonzero = false;
+    let mut needs_scaled = false;
+    for (&left, &right) in a.iter().zip(b) {
+        let d = left.to_f64() - right;
+        any_nonzero |= d != 0.0;
+        let term = d * d;
+        if !term.is_finite() {
+            needs_scaled = true;
+            break;
+        }
+        compensated_add(&mut sum, &mut correction, term);
+    }
+    if !needs_scaled {
+        let out = compensated_finish(sum, correction);
+        return if out == 0.0 && any_nonzero {
+            f64::MIN_POSITIVE
+        } else {
+            out
+        };
+    }
+
+    let mut scale = 0.0f64;
+    for (&left, &right) in a.iter().zip(b) {
+        scale = scale.max((left.to_f64() - right).abs());
+    }
+    if scale == 0.0 {
+        return 0.0;
+    }
+    let scaled = stable_sum(a.iter().zip(b).map(|(&left, &right)| {
+        let d = (left.to_f64() - right) / scale;
+        d * d
+    }));
+    let scale2 = scale * scale;
+    if scale2.is_infinite() {
+        return f64::INFINITY;
+    }
+    let out = scaled * scale2;
+    if out == 0.0 && any_nonzero {
+        f64::MIN_POSITIVE
+    } else {
+        out
+    }
 }
 
 fn zero_f64_vec(v: &[f64]) -> bool {
@@ -3476,77 +4662,6 @@ fn cmp_scalar_vec<S: Scalar>(a: &[S], b: &[S]) -> Ordering {
     a.len().cmp(&b.len())
 }
 
-fn recognition_cmp(a: &Recognition, b: &Recognition) -> Ordering {
-    let input_order = if Arc::ptr_eq(&a.local_input, &b.local_input) {
-        Ordering::Equal
-    } else {
-        cmp_vec(a.local_input.as_ref(), b.local_input.as_ref())
-    };
-    input_order.then_with(|| cmp_vec(&a.recognised, &b.recognised))
-}
-
-fn dedup_single_layer_recognitions(readout: &mut Vec<Recognition>) {
-    readout.dedup_by(|a, b| {
-        Arc::ptr_eq(&a.local_input, &b.local_input) && a.recognised == b.recognised
-    });
-}
-
-fn dedup_recognitions(readout: &mut Vec<Recognition>) {
-    readout.dedup_by(|a, b| {
-        (Arc::ptr_eq(&a.local_input, &b.local_input) || a.local_input == b.local_input)
-            && a.recognised == b.recognised
-    });
-}
-
-fn sort_dedup_recognitions(readout: &mut Vec<Recognition>) {
-    if readout
-        .windows(2)
-        .any(|pair| recognition_cmp(&pair[0], &pair[1]) == Ordering::Greater)
-    {
-        readout.sort_by(recognition_cmp);
-    }
-    dedup_recognitions(readout);
-}
-
-fn temporal_recognition_cmp(a: &TemporalRecognition, b: &TemporalRecognition) -> Ordering {
-    a.universe
-        .as_ref()
-        .cmp(b.universe.as_ref())
-        .then_with(|| cmp_vec(a.previous_input.as_ref(), b.previous_input.as_ref()))
-        .then_with(|| cmp_vec(a.current_input.as_ref(), b.current_input.as_ref()))
-        .then_with(|| cmp_vec(&a.previous_recognised, &b.previous_recognised))
-        .then_with(|| cmp_vec(&a.current_recognised, &b.current_recognised))
-}
-
-fn sort_dedup_temporal_recognitions(readout: &mut Vec<TemporalRecognition>) {
-    readout.sort_by(temporal_recognition_cmp);
-    readout.dedup_by(|a, b| {
-        a.universe == b.universe
-            && a.previous_input == b.previous_input
-            && a.current_input == b.current_input
-            && a.previous_recognised == b.previous_recognised
-            && a.current_recognised == b.current_recognised
-    });
-}
-
-fn prediction_cmp(a: &Prediction, b: &Prediction) -> Ordering {
-    a.universe
-        .cmp(&b.universe)
-        .then_with(|| cmp_vec(&a.current_context, &b.current_context))
-        .then_with(|| cmp_vec(&a.recognised_source, &b.recognised_source))
-        .then_with(|| cmp_vec(&a.predicted_successor, &b.predicted_successor))
-}
-
-fn sort_dedup_predictions(readout: &mut Vec<Prediction>) {
-    readout.sort_by(prediction_cmp);
-    readout.dedup_by(|a, b| {
-        a.universe == b.universe
-            && a.current_context == b.current_context
-            && a.recognised_source == b.recognised_source
-            && a.predicted_successor == b.predicted_successor
-    });
-}
-
 fn ratio_string(numerator: u64, denominator: u64) -> Result<String> {
     if denominator == 0 {
         return Err(Error::Invalid("zero budget unit".into()));
@@ -3577,7 +4692,85 @@ fn ratio_string(numerator: u64, denominator: u64) -> Result<String> {
     Ok(out)
 }
 
-fn push_float(out: &mut String, value: f64) {
+trait JsonSink {
+    fn push_str(&mut self, text: &str);
+    fn push(&mut self, ch: char);
+}
+
+impl JsonSink for String {
+    #[inline]
+    fn push_str(&mut self, text: &str) {
+        String::push_str(self, text);
+    }
+
+    #[inline]
+    fn push(&mut self, ch: char) {
+        String::push(self, ch);
+    }
+}
+
+struct IoJsonSink<'a, W: IoWrite> {
+    writer: &'a mut W,
+    error: Option<std::io::Error>,
+}
+
+impl<'a, W: IoWrite> IoJsonSink<'a, W> {
+    fn new(writer: &'a mut W) -> Self {
+        Self {
+            writer,
+            error: None,
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        match self.error {
+            Some(error) => Err(Error::Io(error.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    #[inline]
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        if self.error.is_none() {
+            if let Err(error) = self.writer.write_all(bytes) {
+                self.error = Some(error);
+            }
+        }
+    }
+}
+
+impl<W: IoWrite> JsonSink for IoJsonSink<'_, W> {
+    #[inline]
+    fn push_str(&mut self, text: &str) {
+        self.write_bytes(text.as_bytes());
+    }
+
+    #[inline]
+    fn push(&mut self, ch: char) {
+        let mut encoded = [0u8; 4];
+        self.write_bytes(ch.encode_utf8(&mut encoded).as_bytes());
+    }
+}
+
+fn sink_quote(out: &mut impl JsonSink, text: &str) {
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if c < '\u{20}' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn push_float(out: &mut impl JsonSink, value: f64) {
     if value == 0.0 {
         out.push_str("0.0");
     } else {
@@ -3585,7 +4778,7 @@ fn push_float(out: &mut String, value: f64) {
     }
 }
 
-fn write_kernel_list<S: Scalar>(out: &mut String, kernels: &[Kernel<S>]) {
+fn write_kernel_list<S: Scalar>(out: &mut impl JsonSink, kernels: &[Kernel<S>]) {
     for (i, kernel) in kernels.iter().enumerate() {
         if i > 0 {
             out.push(',');
@@ -3605,7 +4798,7 @@ fn write_kernel_list<S: Scalar>(out: &mut String, kernels: &[Kernel<S>]) {
     }
 }
 
-fn write_kernel<S: Scalar>(out: &mut String, kernel: &Kernel<S>) {
+fn write_kernel<S: Scalar>(out: &mut impl JsonSink, kernel: &Kernel<S>) {
     out.push_str("{\"W\":");
     push_float(out, kernel.weight());
     out.push_str(",\"C\":[");
@@ -3719,116 +4912,56 @@ pub fn parse_presentation_json(text: &str) -> Result<Vec<Vec<f64>>> {
     Ok(out)
 }
 
-fn write_temporal_recognition_items(out: &mut String, sequences: &[TemporalRecognition]) {
-    for (i, rec) in sequences.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push('[');
-        json::quote(out, &rec.universe);
-        out.push_str(",[");
-        write_f64_vec(out, rec.previous_input.as_ref());
-        out.push(',');
-        write_f64_vec(out, rec.current_input.as_ref());
-        out.push_str("],[");
-        write_f64_vec(out, &rec.previous_recognised);
-        out.push(',');
-        write_f64_vec(out, &rec.current_recognised);
-        out.push_str("]]");
+pub fn parse_weighted_presentation_json(text: &str) -> Result<Vec<InputAtom>> {
+    let value = json::parse(text)?;
+    let json::Value::Array(items) = value else {
+        return Err(Error::Invalid(
+            "weighted presentation must be a JSON array".into(),
+        ));
+    };
+    if items.is_empty() {
+        return Err(Error::Invalid("presentation must be nonempty".into()));
     }
-}
-
-pub fn step_report_json(report: &StepReport) -> String {
-    let mut out = String::with_capacity(768);
-    out.push('{');
-    out.push_str("\"step_index\":");
-    out.push_str(&report.step_index.to_string());
-    out.push_str(",\"readout\":");
-    match &report.readout {
-        Readout::Geometry(concepts) => write_recognition_list(&mut out, concepts),
-        Readout::Temporal {
-            concepts,
-            sequences,
-        } => {
-            out.push_str("{\"concepts\":");
-            write_recognition_list(&mut out, concepts);
-            out.push_str(",\"sequences\":[");
-            write_temporal_recognition_items(&mut out, sequences);
-            out.push_str("]}");
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.into_iter().enumerate() {
+        let json::Value::Array(parts) = item else {
+            return Err(Error::Invalid(
+                "weighted presentation items must be [W,C,V]".into(),
+            ));
+        };
+        if parts.len() != 3 {
+            return Err(Error::Invalid(
+                "weighted presentation items must be [W,C,V]".into(),
+            ));
         }
-        Readout::Predictive {
-            concepts,
-            sequences,
-            predictions,
-        } => {
-            out.push_str("{\"concepts\":");
-            write_recognition_list(&mut out, concepts);
-            out.push_str(",\"sequences\":[");
-            write_temporal_recognition_items(&mut out, sequences);
-            out.push_str("],\"predictions\":[");
-            for (i, prediction) in predictions.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push('[');
-                json::quote(&mut out, &prediction.universe);
-                out.push(',');
-                write_f64_vec(&mut out, &prediction.current_context);
-                out.push(',');
-                write_f64_vec(&mut out, &prediction.recognised_source);
-                out.push(',');
-                write_f64_vec(&mut out, &prediction.predicted_successor);
-                out.push(']');
-            }
-            out.push_str("]}");
+        let mut it = parts.into_iter();
+        let weight_value = it
+            .next()
+            .ok_or_else(|| Error::Invalid("weighted presentation item lost weight".into()))?;
+        let weight = expect_f64(weight_value, "weight")?;
+        let center_value = it
+            .next()
+            .ok_or_else(|| Error::Invalid("weighted presentation item lost center".into()))?;
+        let json::Value::Array(coords) = center_value else {
+            return Err(Error::Invalid(format!(
+                "presentation[{i}].center must be a vector"
+            )));
+        };
+        let mut center = Vec::with_capacity(coords.len());
+        for c in coords {
+            center.push(expect_f64(c, "vector component")?);
         }
+        let variance_value = it
+            .next()
+            .ok_or_else(|| Error::Invalid("weighted presentation item lost variance".into()))?;
+        let variance = expect_f64(variance_value, "variance")?;
+        out.push(InputAtom {
+            weight,
+            center,
+            variance,
+        });
     }
-    out.push_str(",\"transformations\":[");
-    for (i, t) in report.transformations.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        write_transformation(&mut out, t);
-    }
-    out.push_str("],\"maintenance_open_units\":");
-    out.push_str(&report.maintenance_open_units.to_string());
-    out.push_str(",\"maintenance_units\":");
-    out.push_str(&report.maintenance_units.to_string());
-    out.push_str(",\"budget_units\":");
-    out.push_str(&report.budget_units.to_string());
-    out.push_str(",\"layer_reports\":[");
-    for (i, r) in report.layer_reports.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        write_layer_report(&mut out, r);
-    }
-    out.push_str("],\"temporal_reports\":[");
-    for (i, r) in report.temporal_reports.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        write_layer_report(&mut out, r);
-    }
-    out.push_str("]}");
-    out
-}
-
-fn write_recognition_list(out: &mut String, values: &[Recognition]) {
-    out.push('[');
-    for (i, rec) in values.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push('[');
-        json::quote(out, &rec.universe);
-        out.push(',');
-        write_f64_vec(out, rec.local_input.as_ref());
-        out.push(',');
-        write_f64_vec(out, &rec.recognised);
-        out.push(']');
-    }
-    out.push(']');
+    Ok(out)
 }
 
 pub fn summary_json(summary: &Summary) -> String {
@@ -3838,16 +4971,14 @@ pub fn summary_json(summary: &Summary) -> String {
     out.push_str(&summary.steps_seen.to_string());
     out.push_str(",\"dimension\":");
     out.push_str(&summary.dimension.to_string());
-    out.push_str(",\"universe\":");
-    json::quote(&mut out, &summary.universe);
     out.push_str(",\"scalar\":");
-    json::quote(&mut out, summary.scalar);
+    sink_quote(&mut out, summary.scalar);
     out.push_str(",\"memory\":");
     push_float(&mut out, summary.memory);
     out.push_str(",\"eta\":");
     push_float(&mut out, summary.eta);
     out.push_str(",\"mode\":");
-    json::quote(&mut out, summary.mode.as_str());
+    sink_quote(&mut out, summary.mode.as_str());
     out.push_str(",\"chi\":");
     push_float(&mut out, summary.chi);
     out.push_str(",\"alpha\":");
@@ -3874,7 +5005,7 @@ pub fn summary_json(summary: &Summary) -> String {
     out.push_str("],\"maintenance_units\":");
     out.push_str(&summary.maintenance_units.to_string());
     out.push_str(",\"budget\":");
-    json::quote(&mut out, &summary.budget);
+    sink_quote(&mut out, &summary.budget);
     out.push_str(",\"budget_units\":");
     out.push_str(&summary.budget_units.to_string());
     out.push_str(",\"budget_margin_units\":");
@@ -3883,17 +5014,6 @@ pub fn summary_json(summary: &Summary) -> String {
     out.push_str(if summary.is_solvent { "true" } else { "false" });
     out.push('}');
     out
-}
-
-fn write_f64_vec(out: &mut String, values: &[f64]) {
-    out.push('[');
-    for (i, x) in values.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        push_float(out, *x);
-    }
-    out.push(']');
 }
 
 fn write_usize_vec(out: &mut String, values: &[usize]) {
@@ -3907,7 +5027,108 @@ fn write_usize_vec(out: &mut String, values: &[usize]) {
     out.push(']');
 }
 
-fn write_transformation(out: &mut String, t: &Transformation) {
+fn write_f64_vec(out: &mut impl JsonSink, values: &[f64]) {
+    out.push('[');
+    for (i, x) in values.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_float(out, *x);
+    }
+    out.push(']');
+}
+
+fn write_output_presentation(out: &mut impl JsonSink, presentation: &OutputPresentation) {
+    out.push('[');
+    for (i, atom) in presentation.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('[');
+        push_float(out, atom.weight);
+        out.push(',');
+        write_f64_vec(out, &atom.center);
+        out.push(',');
+        push_float(out, atom.variance);
+        out.push(']');
+    }
+    out.push(']');
+}
+
+fn write_output_family(out: &mut impl JsonSink, family: &[OutputPresentation]) {
+    out.push('[');
+    for (i, presentation) in family.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_output_presentation(out, presentation);
+    }
+    out.push(']');
+}
+
+fn write_step_report_sink(out: &mut impl JsonSink, report: &StepReport) {
+    out.push('{');
+    out.push_str("\"step_index\":");
+    out.push_str(&report.step_index.to_string());
+    out.push_str(",\"readout\":{");
+    match &report.readout {
+        Readout::Geometry { present } => {
+            out.push_str("\"present\":");
+            write_output_family(out, present);
+        }
+        Readout::Predictive { present, future } => {
+            out.push_str("\"present\":");
+            write_output_family(out, present);
+            out.push_str(",\"future\":");
+            write_output_family(out, future);
+        }
+    }
+    out.push('}');
+    out.push_str(",\"transformations\":[");
+    for (i, t) in report.transformations.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_transformation(out, t);
+    }
+    out.push_str("],\"maintenance_open_units\":");
+    out.push_str(&report.maintenance_open_units.to_string());
+    out.push_str(",\"maintenance_units\":");
+    out.push_str(&report.maintenance_units.to_string());
+    out.push_str(",\"budget_units\":");
+    out.push_str(&report.budget_units.to_string());
+    out.push_str(",\"layer_reports\":[");
+    for (i, r) in report.layer_reports.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_layer_report(out, r);
+    }
+    out.push_str("],\"temporal_reports\":[");
+    for (i, r) in report.temporal_reports.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_layer_report(out, r);
+    }
+    out.push_str("]}");
+}
+
+pub fn step_report_json(report: &StepReport) -> String {
+    let mut out = String::with_capacity(768);
+    write_step_report_sink(&mut out, report);
+    out
+}
+
+/// Stream a StepReport directly to a writer.  The network is borrowed only;
+/// an I/O failure cannot mutate cognitive state.
+pub fn write_step_report_json<W: IoWrite>(writer: &mut W, report: &StepReport) -> Result<()> {
+    let mut sink = IoJsonSink::new(writer);
+    write_step_report_sink(&mut sink, report);
+    sink.finish()
+}
+
+fn write_transformation(out: &mut impl JsonSink, t: &Transformation) {
     match t {
         Transformation::ClearSigma { count } => {
             out.push_str("{\"phase\":\"solvency\",\"type\":\"clear_sigma\",\"count\":");
@@ -3938,7 +5159,7 @@ fn write_transformation(out: &mut String, t: &Transformation) {
             count,
         } => {
             out.push_str("{\"phase\":");
-            json::quote(out, space.as_str());
+            sink_quote(out, space.as_str());
             out.push_str(",\"type\":\"promote\",\"layer\":");
             out.push_str(&layer.to_string());
             out.push_str(",\"count\":");
@@ -3986,7 +5207,7 @@ fn write_transformation(out: &mut String, t: &Transformation) {
     }
 }
 
-fn write_layer_report(out: &mut String, r: &LayerReport) {
+fn write_layer_report(out: &mut impl JsonSink, r: &LayerReport) {
     out.push('{');
     macro_rules! int_field {
         ($name:literal, $value:expr) => {{
@@ -3995,7 +5216,7 @@ fn write_layer_report(out: &mut String, r: &LayerReport) {
         }};
     }
     out.push_str("\"phase\":");
-    json::quote(out, r.phase.as_str());
+    sink_quote(out, r.phase.as_str());
     out.push(',');
     int_field!("layer_index", r.layer_index);
     out.push(',');
@@ -4046,36 +5267,16 @@ mod tests {
     use super::*;
 
     fn make64() -> Auxein<f64> {
-        Auxein::new(1, 10.0, 1.0, Budget::kernels("100"), "auxein").unwrap()
-    }
-
-    fn make_temporal64() -> Auxein<f64> {
-        Auxein::new_with_mode(
-            1,
-            10.0,
-            1.0,
-            Mode::Temporal,
-            Budget::kernels("100"),
-            "auxein",
-        )
-        .unwrap()
+        Auxein::new(1, 10.0, 1.0, Budget::kernels("100")).unwrap()
     }
 
     fn make_predictive64() -> Auxein<f64> {
-        Auxein::new_with_mode(
-            1,
-            10.0,
-            1.0,
-            Mode::Predictive,
-            Budget::kernels("100"),
-            "auxein",
-        )
-        .unwrap()
+        Auxein::new_with_mode(1, 10.0, 1.0, Mode::Predictive, Budget::kernels("100")).unwrap()
     }
 
     #[test]
     fn packing() {
-        let n = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("0"), "auxein").unwrap();
+        let n = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("0")).unwrap();
         assert_eq!(n.kernel_units().unwrap(), 24);
         assert_eq!(n.network_units().unwrap(), 50);
         assert_eq!(n.min_units().unwrap(), 66);
@@ -4090,15 +5291,18 @@ mod tests {
             n.step(&[vec![x]], false).unwrap();
             n.step(&[vec![x]], false).unwrap();
             let report = n.step(&[vec![x]], false).unwrap();
-            assert_eq!(report.readout.len(), 1);
-            assert_eq!(report.readout[0].local_input.as_ref(), &[x]);
-            assert_eq!(report.readout[0].recognised, vec![x]);
+            assert_eq!(report.readout.present().len(), 1);
+            let atoms = &report.readout.present()[0];
+            assert_eq!(atoms.len(), 1);
+            assert_eq!(atoms[0].weight, 1.0);
+            assert_eq!(atoms[0].center, vec![x]);
+            assert_eq!(atoms[0].variance, 0.0);
         }
     }
 
     #[test]
     fn f64_support_underflow_is_not_cognitive_death() {
-        let mut n = Auxein::<f64>::new(1, 0.25, 1.0, Budget::kernels("1000"), "auxein").unwrap();
+        let mut n = Auxein::<f64>::new(1, 0.25, 1.0, Budget::kernels("1000")).unwrap();
         n.step(&[vec![10.0]], false).unwrap();
         for _ in 0..320 {
             n.step(&[vec![1.0]], false).unwrap();
@@ -4122,8 +5326,9 @@ mod tests {
         assert_eq!(n.layers()[0].cells().len(), 1);
         assert_eq!(n.layers().len(), 1);
         let r3 = n.step(&[vec![2.0]], true).unwrap();
-        assert_eq!(r3.readout.len(), 1);
-        assert_eq!(r3.readout[0].recognised, vec![2.0]);
+        assert_eq!(r3.readout.present().len(), 1);
+        assert_eq!(r3.readout.present()[0].len(), 1);
+        assert_eq!(r3.readout.present()[0][0].center, vec![2.0]);
         assert!(!r3.layer_reports[0].context_emitted);
         assert_eq!(n.layers().len(), 1);
     }
@@ -4140,8 +5345,7 @@ mod tests {
         assert!(!report.readout.is_empty());
         let after = n.export_json();
         assert_ne!(before, after); // steps_seen changes
-        let restored =
-            Auxein::<f64>::from_json(&after, Budget::units(n.budget_units()), "auxein").unwrap();
+        let restored = Auxein::<f64>::from_json(&after, Budget::units(n.budget_units())).unwrap();
         assert_eq!(restored.export_json(), after);
     }
 
@@ -4159,7 +5363,7 @@ mod tests {
 
     #[test]
     fn whole_presentation_splitting_is_exactly_invariant() {
-        let mut a = Auxein::<f32>::new(3, 10.0, 1.0, Budget::kernels("100"), "auxein").unwrap();
+        let mut a = Auxein::<f32>::new(3, 10.0, 1.0, Budget::kernels("100")).unwrap();
         let mut b = a.clone();
         let p = vec![
             vec![6.125, -5.75, 6.375],
@@ -4181,18 +5385,17 @@ mod tests {
 
     #[test]
     fn f32_state_roundtrip() {
-        let n = Auxein::<f32>::new(1, 10.1, 0.7, Budget::kernels("100"), "x").unwrap();
+        let n = Auxein::<f32>::new(1, 10.1, 0.7, Budget::kernels("100")).unwrap();
         assert_ne!(n.memory(), 10.1);
         let state = n.export_json();
-        let restored =
-            Auxein::<f32>::from_json(&state, Budget::units(n.budget_units()), "x").unwrap();
+        let restored = Auxein::<f32>::from_json(&state, Budget::units(n.budget_units())).unwrap();
         assert_eq!(restored.export_json(), state);
     }
 
     #[test]
     fn f32_projected_seed_is_revalidated_before_persistence() {
-        let state = r#"{"format_version":4,"dimension":2,"scalar":"f32","memory":1.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0,1.0],"V":0.0}]}]}"#;
-        let mut n = Auxein::<f32>::from_json(state, Budget::kernels("100"), "projection").unwrap();
+        let state = r#"{"format_version":5,"dimension":2,"scalar":"f32","memory":1.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0,1.0],"V":0.0}]}]}"#;
+        let mut n = Auxein::<f32>::from_json(state, Budget::kernels("100")).unwrap();
 
         // In binary64 this point is just outside the strict first CONCERN
         // bound x+y>1. Its f32 projection lies just inside it. A raw seed may
@@ -4205,8 +5408,7 @@ mod tests {
         assert!(n.layers()[0].sigma().is_empty());
         let persisted = n.export_json();
         let restored =
-            Auxein::<f32>::from_json(&persisted, Budget::units(n.budget_units()), "projection")
-                .unwrap();
+            Auxein::<f32>::from_json(&persisted, Budget::units(n.budget_units())).unwrap();
         assert_eq!(restored.export_json(), persisted);
     }
 
@@ -4245,7 +5447,7 @@ mod tests {
 
     #[test]
     fn growth_is_all_or_nothing() {
-        let mut small = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("1"), "auxein").unwrap();
+        let mut small = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("1")).unwrap();
         let report = small.step(&[vec![-2.0], vec![2.0]], false).unwrap();
         assert_eq!(small.layers()[0].sigma().len(), 0);
         assert!(report
@@ -4253,15 +5455,15 @@ mod tests {
             .iter()
             .any(|t| matches!(t, Transformation::GrowthReject { .. })));
 
-        let mut roomy = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("2"), "auxein").unwrap();
+        let mut roomy = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("2")).unwrap();
         roomy.step(&[vec![-2.0], vec![2.0]], false).unwrap();
         assert_eq!(roomy.layers()[0].sigma().len(), 2);
     }
 
     #[test]
     fn context_frontier_is_in_growth_transaction() {
-        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
-        let mut roomy = Auxein::<f64>::from_json(state, Budget::kernels("100"), "auxein").unwrap();
+        let state = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
+        let mut roomy = Auxein::<f64>::from_json(state, Budget::kernels("100")).unwrap();
         let report = roomy.step(&[vec![1.0], vec![3.0]], true).unwrap();
         assert!(report.layer_reports[0].context_emitted);
         assert_eq!(roomy.layers().len(), 2);
@@ -4276,11 +5478,12 @@ mod tests {
 
     #[test]
     fn multiwinner_allocation_is_conservative() {
-        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":3.0,"C":[2.0],"V":10.0}]}]}"#;
-        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("100"), "auxein").unwrap();
+        let state = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":3.0,"C":[2.0],"V":10.0}]}]}"#;
+        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("100")).unwrap();
         let report = n.step(&[vec![3.0]], true).unwrap();
         let masses = &report.layer_reports[0].cell_responsibility_mass;
-        assert_eq!(report.readout.len(), 2);
+        assert_eq!(report.readout.present().len(), 1);
+        assert_eq!(report.readout.present()[0].len(), 2);
         assert!((stable_sum(masses.iter().copied()) - 1.0).abs() < 1e-15);
         assert!((masses[0] - 5.0 / 29.0).abs() < 1e-15);
         assert!((masses[1] - 24.0 / 29.0).abs() < 1e-15);
@@ -4288,7 +5491,7 @@ mod tests {
 
     #[test]
     fn forced_solvency_destroys_work_then_knowledge() {
-        let mut n = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("20"), "auxein").unwrap();
+        let mut n = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("20")).unwrap();
         for x in [-2.0, 2.0, -2.0, 2.0, -2.0, 2.0] {
             n.step(&[vec![x]], false).unwrap();
         }
@@ -4361,9 +5564,28 @@ mod tests {
     }
 
     #[test]
+    fn large_multiwinner_readout_closes_mass_without_false_overflow() {
+        let mut cells = Vec::new();
+        let mut concerned = Vec::new();
+        for i in 0..4096usize {
+            let center = [1.0 + i as f64 * 1e-9];
+            cells.push(Kernel::<f64>::new(1.0, &center, 10.0).unwrap());
+            concerned.push((i, 3.0 + i as f64 * 1e-12));
+        }
+        let mut contributions = Vec::new();
+        append_gain_weighted_knowledge(&cells, &concerned, 1.0, &mut contributions);
+        coalesce_knowledge_contributions(&cells, &mut contributions);
+        let knowledge = build_output_knowledge(&cells, &contributions);
+        let output = complete_output_presentation(knowledge, 1).unwrap();
+        let total = stable_sum(output.iter().map(|atom| atom.weight));
+        assert!(total > 0.0 && total <= 1.0, "total={total:.17e}");
+        assert!(output.iter().all(|atom| atom.weight > 0.0));
+    }
+
+    #[test]
     fn strict_state_rejects_unrepresentable_f32_config() {
-        let bad = r#"{"format_version":4,"dimension":1,"scalar":"f32","memory":10.1,"eta":0.7,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[]}]}"#;
-        assert!(Auxein::<f32>::from_json(bad, Budget::kernels("10"), "x").is_err());
+        let bad = r#"{"format_version":5,"dimension":1,"scalar":"f32","memory":10.1,"eta":0.7,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[]}]}"#;
+        assert!(Auxein::<f32>::from_json(bad, Budget::kernels("10")).is_err());
     }
     #[test]
     fn local_coalesce_matches_full_coalesce() {
@@ -4425,7 +5647,7 @@ mod tests {
             zero: false,
         }];
         let mut targets = Targets::default();
-        targets.reset(1, 1, true);
+        targets.reset(1, 1, true).unwrap();
         targets.add_atom(0, 0, 1e-200);
         targets
             .apply_population(&mut kernels, &presentation, 0.5, 0.5)
@@ -4457,7 +5679,9 @@ mod tests {
                 zero: false,
             }];
             let mut general_targets = Targets::default();
-            general_targets.reset(original.len(), x.len(), true);
+            general_targets
+                .reset(original.len(), x.len(), true)
+                .unwrap();
             for &(index, weight) in &responsibilities {
                 general_targets.add_atom(index, 0, weight);
             }
@@ -4467,7 +5691,9 @@ mod tests {
                 .unwrap();
 
             let mut single_targets = Targets::default();
-            single_targets.reset(original.len(), x.len(), false);
+            single_targets
+                .reset(original.len(), x.len(), false)
+                .unwrap();
             for &(index, weight) in &responsibilities {
                 let distance2 =
                     stable_sum(original[index].center.iter().zip(x).map(|(&old, new)| {
@@ -4498,10 +5724,10 @@ mod tests {
 
     #[test]
     fn context_geometry_ignores_learning_responsibility() {
-        let state_a = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":1.0,"C":[2.0],"V":10.0}]}]}"#;
-        let state_b = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":100.0,"C":[2.0],"V":10.0}]}]}"#;
-        let mut a = Auxein::<f64>::from_json(state_a, Budget::kernels("100"), "auxein").unwrap();
-        let mut b = Auxein::<f64>::from_json(state_b, Budget::kernels("100"), "auxein").unwrap();
+        let state_a = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":1.0,"C":[2.0],"V":10.0}]}]}"#;
+        let state_b = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":100.0,"C":[2.0],"V":10.0}]}]}"#;
+        let mut a = Auxein::<f64>::from_json(state_a, Budget::kernels("100")).unwrap();
+        let mut b = Auxein::<f64>::from_json(state_b, Budget::kernels("100")).unwrap();
         let ra = a.step(&[vec![3.0]], true).unwrap();
         let rb = b.step(&[vec![3.0]], true).unwrap();
         assert_ne!(
@@ -4520,14 +5746,16 @@ mod tests {
             ra.layer_reports[0].output_mass,
             rb.layer_reports[0].output_mass
         );
-        assert_eq!(ra.layer_reports[0].context_center, Some(vec![1.5]));
-        assert_eq!(ra.layer_reports[0].context_variance, Some(0.25));
+        assert!(
+            (ra.layer_reports[0].context_center.as_ref().unwrap()[0] - 21.0 / 13.0).abs() < 1e-15
+        );
+        assert!((ra.layer_reports[0].context_variance.unwrap() - 520.0 / 2197.0).abs() < 1e-15);
     }
 
     #[test]
     fn context_mass_is_recognised_input_mass_without_duplication() {
-        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
-        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("100"), "auxein").unwrap();
+        let state = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
+        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("100")).unwrap();
         let r = n.step(&[vec![1.0], vec![3.0], vec![-10.0]], true).unwrap();
         let layer = &r.layer_reports[0];
         assert_eq!(layer.input_mass, 1.0);
@@ -4535,26 +5763,26 @@ mod tests {
         assert_eq!(layer.context_center, Some(vec![2.0]));
         assert_eq!(layer.context_variance, Some(1.0));
 
-        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":1.0,"C":[2.0],"V":10.0}]}]}"#;
-        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("100"), "auxein").unwrap();
+        let state = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":1.0,"C":[2.0],"V":10.0}]}]}"#;
+        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("100")).unwrap();
         let r = n.step(&[vec![3.0]], true).unwrap();
         let layer = &r.layer_reports[0];
         assert_eq!(layer.output_mass, 1.0);
-        assert_eq!(layer.context_center, Some(vec![1.5]));
-        assert_eq!(layer.context_variance, Some(0.25));
+        assert!((layer.context_center.as_ref().unwrap()[0] - 21.0 / 13.0).abs() < 1e-15);
+        assert!((layer.context_variance.unwrap() - 520.0 / 2197.0).abs() < 1e-15);
     }
 
     #[test]
     fn singleton_and_zero_center_contexts_are_vertical_silence() {
-        let singleton = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[2.0],"V":0.0}]}]}"#;
-        let mut n = Auxein::<f64>::from_json(singleton, Budget::kernels("100"), "auxein").unwrap();
+        let singleton = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[2.0],"V":0.0}]}]}"#;
+        let mut n = Auxein::<f64>::from_json(singleton, Budget::kernels("100")).unwrap();
         let r = n.step(&[vec![2.0]], true).unwrap();
         assert_eq!(r.layer_reports[0].context_center, Some(vec![2.0]));
         assert_eq!(r.layer_reports[0].context_variance, Some(0.0));
         assert!(!r.layer_reports[0].context_emitted);
 
-        let symmetric = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[-1.0],"V":0.0},{"W":1.0,"C":[1.0],"V":0.0}]}]}"#;
-        let mut n = Auxein::<f64>::from_json(symmetric, Budget::kernels("100"), "auxein").unwrap();
+        let symmetric = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[-1.0],"V":0.0},{"W":1.0,"C":[1.0],"V":0.0}]}]}"#;
+        let mut n = Auxein::<f64>::from_json(symmetric, Budget::kernels("100")).unwrap();
         let r = n.step(&[vec![-1.0], vec![1.0]], true).unwrap();
         assert_eq!(r.layer_reports[0].context_center, Some(vec![0.0]));
         assert_eq!(r.layer_reports[0].context_variance, Some(1.0));
@@ -4563,8 +5791,8 @@ mod tests {
 
     #[test]
     fn perfect_pair_emits_one_context_and_stops_after_l1_learns_it() {
-        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
-        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("1000"), "auxein").unwrap();
+        let state = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]}]}"#;
+        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("1000")).unwrap();
         let first = n.step(&[vec![1.0], vec![3.0]], true).unwrap();
         assert_eq!(first.layer_reports[0].context_center, Some(vec![2.0]));
         assert_eq!(first.layer_reports[0].context_variance, Some(1.0));
@@ -4580,8 +5808,8 @@ mod tests {
 
     #[test]
     fn constant_input_with_two_explanations_does_not_build_deep_cascade() {
-        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":1.0},{"W":1.0,"C":[2.0],"V":1.0}]}]}"#;
-        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("1000"), "auxein").unwrap();
+        let state = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":1.0},{"W":1.0,"C":[2.0],"V":1.0}]}]}"#;
+        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("1000")).unwrap();
         for _ in 0..40 {
             n.step(&[vec![1.5]], false).unwrap();
         }
@@ -4592,13 +5820,101 @@ mod tests {
     }
 
     #[test]
-    fn lazy_cell_decay_matches_eager_materialization() {
+    fn lazy_decay_preserves_cognitive_trajectory() {
+        fn close_support<S: Scalar>(a: f64, b: f64) -> bool {
+            let scale = a.abs().max(b.abs()).max(S::min_positive().to_f64());
+            let tolerance = if S::NAME == "f32" { 2.0e-5 } else { 2.0e-12 };
+            (a - b).abs() <= tolerance * scale
+        }
+
+        fn assert_presentations_close<S: Scalar>(
+            left: &[OutputPresentation],
+            right: &[OutputPresentation],
+        ) {
+            assert_eq!(left.len(), right.len());
+            for (a, b) in left.iter().zip(right) {
+                assert_eq!(a.len(), b.len());
+                for (x, y) in a.iter().zip(b) {
+                    assert!(close_support::<S>(x.weight, y.weight));
+                    assert!(close_support::<S>(x.variance, y.variance));
+                    assert_eq!(x.center.len(), y.center.len());
+                    for (&xc, &yc) in x.center.iter().zip(&y.center) {
+                        assert!(close_support::<S>(xc, yc));
+                    }
+                }
+            }
+        }
+
+        fn assert_report_causally_equal<S: Scalar>(a: &StepReport, b: &StepReport) {
+            assert_eq!(a.step_index, b.step_index);
+            assert_eq!(a.transformations, b.transformations);
+            assert_eq!(a.maintenance_open_units, b.maintenance_open_units);
+            assert_eq!(a.maintenance_units, b.maintenance_units);
+            assert_eq!(a.budget_units, b.budget_units);
+            assert_presentations_close::<S>(a.readout.present(), b.readout.present());
+            assert_presentations_close::<S>(a.readout.future(), b.readout.future());
+            assert_eq!(a.layer_reports.len(), b.layer_reports.len());
+            assert_eq!(a.temporal_reports.len(), b.temporal_reports.len());
+            for (x, y) in a
+                .layer_reports
+                .iter()
+                .chain(&a.temporal_reports)
+                .zip(b.layer_reports.iter().chain(&b.temporal_reports))
+            {
+                assert_eq!(x.phase, y.phase);
+                assert_eq!(x.layer_index, y.layer_index);
+                assert_eq!(x.input_atom_count, y.input_atom_count);
+                assert_eq!(x.unknown_atom_count, y.unknown_atom_count);
+                assert_eq!(x.recognised_atom_count, y.recognised_atom_count);
+                assert_eq!(x.cell_count_before, y.cell_count_before);
+                assert_eq!(x.cell_count_after, y.cell_count_after);
+                assert_eq!(x.sigma_count_before, y.sigma_count_before);
+                assert_eq!(x.sigma_count_after, y.sigma_count_after);
+                assert_eq!(x.promoted, y.promoted);
+                assert_eq!(x.seed_requests, y.seed_requests);
+                assert_eq!(x.context_emitted, y.context_emitted);
+                assert_eq!(x.output_atom_count, y.output_atom_count);
+                assert_eq!(x.recognition_count, y.recognition_count);
+                assert_eq!(x.present_atom_count, y.present_atom_count);
+                assert!(close_support::<S>(x.input_mass, y.input_mass));
+                assert!(close_support::<S>(x.output_mass, y.output_mass));
+                assert!(close_support::<S>(x.knowledge_mass, y.knowledge_mass));
+                assert!(close_support::<S>(x.present_mass, y.present_mass));
+                assert_eq!(
+                    x.cell_responsibility_mass.len(),
+                    y.cell_responsibility_mass.len()
+                );
+                for (&r1, &r2) in x
+                    .cell_responsibility_mass
+                    .iter()
+                    .zip(&y.cell_responsibility_mass)
+                {
+                    assert!(close_support::<S>(r1, r2));
+                }
+                match (&x.context_center, &y.context_center) {
+                    (Some(cx), Some(cy)) => {
+                        assert_eq!(cx.len(), cy.len());
+                        for (&vx, &vy) in cx.iter().zip(cy) {
+                            assert!(close_support::<S>(vx, vy));
+                        }
+                    }
+                    (None, None) => {}
+                    _ => panic!("context topology differs"),
+                }
+                match (x.context_variance, y.context_variance) {
+                    (Some(vx), Some(vy)) => assert!(close_support::<S>(vx, vy)),
+                    (None, None) => {}
+                    _ => panic!("context topology differs"),
+                }
+            }
+        }
+
         fn run<S: Scalar>() {
             let scalar = S::NAME;
             let state = format!(
-                "{{\"format_version\":4,\"dimension\":1,\"scalar\":\"{scalar}\",\"memory\":23.0,\"eta\":1.0,\"mode\":\"geometry\",\"steps_seen\":0,\"layers\":[{{\"sigma\":[],\"cells\":[{{\"W\":1.0,\"C\":[-3.0],\"V\":0.25}},{{\"W\":2.0,\"C\":[1.0],\"V\":0.25}},{{\"W\":3.0,\"C\":[4.0],\"V\":0.25}}]}}]}}"
+                "{{\"format_version\":5,\"dimension\":1,\"scalar\":\"{scalar}\",\"memory\":23.0,\"eta\":1.0,\"mode\":\"geometry\",\"steps_seen\":0,\"layers\":[{{\"sigma\":[],\"cells\":[{{\"W\":1.0,\"C\":[-3.0],\"V\":0.25}},{{\"W\":2.0,\"C\":[1.0],\"V\":0.25}},{{\"W\":3.0,\"C\":[4.0],\"V\":0.25}}]}}]}}"
             );
-            let mut lazy = Auxein::<S>::from_json(&state, Budget::kernels("100"), "u").unwrap();
+            let mut lazy = Auxein::<S>::from_json(&state, Budget::kernels("100")).unwrap();
             let mut eager = lazy.clone();
 
             for step in 0..240 {
@@ -4621,16 +5937,40 @@ mod tests {
                 };
                 let a = lazy.step(&x, step % 11 == 0).unwrap();
                 let b = eager.step(&x, step % 11 == 0).unwrap();
-                assert_eq!(a, b);
+                // Readout, transformations, growth/contraction and therefore
+                // causal topology must stay identical.  Historical support
+                // projection may differ by a few ulps because the lazy path
+                // evaluates the same homothety in O(log age).
+                assert_report_causally_equal::<S>(&a, &b);
 
                 for layer in &mut eager.layers {
                     let epoch = layer.cell_decay.epoch();
                     let lambda = layer.cell_decay.lambda();
-                    for cell in &mut layer.cells {
-                        cell.materialize_weight_at(epoch, lambda);
+                    for kernel in layer.sigma.iter_mut().chain(&mut layer.cells) {
+                        kernel.materialize_weight_at(epoch, lambda);
                     }
                 }
-                assert_eq!(lazy.export_json(), eager.export_json());
+                assert_eq!(lazy.layers.len(), eager.layers.len());
+                for (left, right) in lazy.layers.iter().zip(&eager.layers) {
+                    assert_eq!(left.cells.len(), right.cells.len());
+                    assert_eq!(left.sigma.len(), right.sigma.len());
+                    for (a, b) in left.cells.iter().zip(&right.cells) {
+                        assert_eq!(a.center.len(), b.center.len());
+                        for (&x, &y) in a.center.iter().zip(&b.center) {
+                            assert!(close_support::<S>(x.to_f64(), y.to_f64()));
+                        }
+                        assert!(close_support::<S>(a.variance.to_f64(), b.variance.to_f64()));
+                        assert!(close_support::<S>(a.weight(), b.weight()));
+                    }
+                    for (a, b) in left.sigma.iter().zip(&right.sigma) {
+                        assert_eq!(a.center.len(), b.center.len());
+                        for (&x, &y) in a.center.iter().zip(&b.center) {
+                            assert!(close_support::<S>(x.to_f64(), y.to_f64()));
+                        }
+                        assert!(close_support::<S>(a.variance.to_f64(), b.variance.to_f64()));
+                        assert!(close_support::<S>(a.weight(), b.weight()));
+                    }
+                }
             }
         }
         run::<f64>();
@@ -4638,9 +5978,67 @@ mod tests {
     }
 
     #[test]
+    fn extreme_squared_norm_is_never_nan() {
+        assert_eq!(norm2(&[f64::MAX]), f64::INFINITY);
+        assert_eq!(norm2(&[f64::from_bits(1)]), 0.0);
+        assert!(!norm2(&[1.0, f64::MAX]).is_nan());
+    }
+
+    #[test]
+    fn distinct_subnormal_centers_keep_positive_context_variance() {
+        fn run<S: Scalar>() {
+            let a = S::min_positive().to_f64();
+            let cells = vec![
+                Kernel::<S>::new(1.0, &[a], 0.0).unwrap(),
+                Kernel::<S>::new(1.0, &[2.0 * a], 0.0).unwrap(),
+            ];
+            let context = build_context_kernel(&cells, &[(0, 0.5), (1, 0.5)], 1).unwrap();
+            assert!(context.variance > 0.0);
+            assert!(context.variance.is_finite());
+            let projected = project_kernel::<S>(context.clone())
+                .unwrap()
+                .variance
+                .to_f64();
+            eprintln!(
+                "scalar={} context_v={:?} projected_v={:?}",
+                S::NAME,
+                context.variance,
+                projected
+            );
+            assert!(projected > 0.0);
+        }
+        run::<f64>();
+        run::<f32>();
+    }
+
+    #[test]
+    fn extreme_context_variance_saturates_finitely() {
+        let cells = vec![
+            Kernel::<f64>::new(1.0, &[-f64::MAX], 0.0).unwrap(),
+            Kernel::<f64>::new(1.0, &[f64::MAX], 0.0).unwrap(),
+        ];
+        let context = build_context_kernel(&cells, &[(0, 0.5), (1, 0.5)], 1).unwrap();
+        assert!(context.variance.is_finite());
+        assert_eq!(context.variance, f64::MAX);
+    }
+
+    #[test]
+    fn contraction_value_is_finite_for_extreme_centers() {
+        let huge = Kernel::<f64>::new(1.0, &[f64::MAX], f64::MAX).unwrap();
+        let tiny = Kernel::<f64>::new(1.0, &[f64::from_bits(1)], 1.0).unwrap();
+        for k in [
+            Auxein::<f64>::cell_value(&huge),
+            Auxein::<f64>::cell_value(&tiny),
+        ] {
+            assert!(k.is_finite());
+            assert!(k > 0.0 && k <= 1.0);
+        }
+    }
+
+    #[test]
     fn lazy_decay_clock_is_clone_local() {
-        let state = r#"{"format_version":4,"dimension":1,"scalar":"f64","memory":31.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[-3.0],"V":0.25},{"W":2.0,"C":[1.0],"V":0.25},{"W":3.0,"C":[4.0],"V":0.25}]}]}"#;
-        let mut original = Auxein::<f64>::from_json(state, Budget::kernels("100"), "u").unwrap();
+        let state = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":31.0,"eta":1.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[-3.0],"V":0.25},{"W":2.0,"C":[1.0],"V":0.25},{"W":3.0,"C":[4.0],"V":0.25}]}]}"#;
+        let mut original = Auxein::<f64>::from_json(state, Budget::kernels("100")).unwrap();
         for _ in 0..80 {
             original.step(&[vec![1.0]], false).unwrap();
         }
@@ -4654,553 +6052,591 @@ mod tests {
     }
 
     #[test]
-    fn temporal_packing() {
-        let n = Auxein::<f64>::new_with_mode(
-            1,
-            10.0,
-            1.0,
-            Mode::Temporal,
-            Budget::kernels("0"),
-            "auxein",
-        )
-        .unwrap();
+    fn predictive_packing() {
+        let n = Auxein::<f64>::new_with_mode(1, 10.0, 1.0, Mode::Predictive, Budget::kernels("0"))
+            .unwrap();
         assert_eq!(n.temporal_kernel_units().unwrap(), 32);
         assert_eq!(n.layer_units().unwrap(), 57);
         assert_eq!(n.min_units().unwrap(), 107);
-        assert_eq!(n.maintenance_units().unwrap(), 107);
     }
 
     #[test]
     fn mode_is_geometry_by_default_and_strict() {
-        let n = make64();
-        assert_eq!(n.mode(), Mode::Geometry);
-        assert!(n.export_json().contains("\"mode\":\"geometry\""));
         assert_eq!(Mode::parse("geometry").unwrap(), Mode::Geometry);
-        assert_eq!(Mode::parse("temporal").unwrap(), Mode::Temporal);
         assert_eq!(Mode::parse("predictive").unwrap(), Mode::Predictive);
-        assert!(Mode::parse("future").is_err());
+        assert!(Mode::parse("temporal").is_err());
+        assert_eq!(make64().mode(), Mode::Geometry);
     }
 
     #[test]
-    fn predictive_projects_existing_temporal_cell_from_current_context() {
-        let mut n = Auxein::<f64>::new_with_mode(
-            1,
-            10.0,
-            0.0,
-            Mode::Predictive,
-            Budget::kernels("100"),
-            "lab",
-        )
-        .unwrap();
-        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
-        // Full temporal variance is deliberately huge: prediction projects only
-        // the source/target centers and cannot reconstruct endpoint variance.
-        n.layers[0].temporal_cells = vec![Kernel::new(7.0, &[1.0, 5.0], 123.0).unwrap()];
-
-        let report = n.step(&[vec![1.0]], false).unwrap();
-        assert_eq!(report.readout.concepts().len(), 1);
-        assert!(report.readout.sequences().is_empty());
-        assert_eq!(report.readout.predictions().len(), 1);
-        let prediction = &report.readout.predictions()[0];
-        assert_eq!(prediction.universe.as_ref(), "lab");
-        assert_eq!(prediction.current_context, vec![1.0]);
-        assert_eq!(prediction.recognised_source, vec![1.0]);
-        assert_eq!(prediction.predicted_successor, vec![5.0]);
-    }
-
-    #[test]
-    fn predictive_branching_emits_every_known_successor_without_selection() {
-        let mut n = make_predictive64();
-        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
-        n.layers[0].temporal_cells = vec![
-            Kernel::new(1.0, &[1.0, 3.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[1.0, 5.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[3.0, 9.0], 0.0).unwrap(), // must not chain 1->3->9
+    fn weighted_boundary_and_zero_remainder_are_canonical() {
+        let state = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":9.0,"C":[2.0],"V":77.0}]}]}"#;
+        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("100")).unwrap();
+        let input = vec![
+            InputAtom::new(0.25, vec![2.0], 0.0),
+            InputAtom::new(0.75, vec![99.0], 0.0),
         ];
-
-        let report = n.step(&[vec![1.0]], false).unwrap();
-        let successors: Vec<Vec<f64>> = report
-            .readout
-            .predictions()
-            .iter()
-            .map(|p| p.predicted_successor.clone())
-            .collect();
-        assert_eq!(successors, vec![vec![3.0], vec![5.0]]);
-    }
-
-    #[test]
-    fn predictive_zero_source_is_silent_and_zero_target_is_explicit() {
-        let mut n = make_predictive64();
-        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
-        n.layers[0].temporal_cells = vec![
-            Kernel::new(1.0, &[0.0, 9.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[1.0, 0.0], 0.0).unwrap(),
-        ];
-
-        let report = n.step(&[vec![1.0]], false).unwrap();
-        assert_eq!(report.readout.predictions().len(), 1);
-        assert_eq!(report.readout.predictions()[0].recognised_source, vec![1.0]);
+        let report = n.step_weighted(&input, false).unwrap();
+        assert_eq!(report.readout.present().len(), 1);
+        let p = &report.readout.present()[0];
+        assert_eq!(p.len(), 2);
         assert_eq!(
-            report.readout.predictions()[0].predicted_successor,
-            vec![0.0]
-        );
-    }
-
-    #[test]
-    fn newly_promoted_temporal_cell_predicts_only_from_next_step() {
-        let mut n = make_predictive64();
-        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
-
-        let first = n.step(&[vec![1.0]], false).unwrap();
-        assert!(first.readout.predictions().is_empty());
-        let second = n.step(&[vec![1.0]], false).unwrap();
-        assert!(second.readout.predictions().is_empty());
-        assert_eq!(n.layers[0].temporal_sigma.len(), 1);
-        let third = n.step(&[vec![1.0]], false).unwrap();
-        assert!(third.readout.predictions().is_empty());
-        assert_eq!(n.layers[0].temporal_cells.len(), 1);
-        let fourth = n.step(&[vec![1.0]], false).unwrap();
-        assert_eq!(fourth.readout.predictions().len(), 1);
-        assert_eq!(
-            fourth.readout.predictions()[0].predicted_successor,
-            vec![1.0]
-        );
-    }
-
-    #[test]
-    fn predictive_and_temporal_have_identical_persistent_trajectory_and_cost() {
-        let mut temporal = make_temporal64();
-        let mut predictive = make_predictive64();
-        let stream = [1.0, 3.0, 1.0, 3.0, 9.0, 1.0, 3.0, 1.0, 3.0];
-
-        assert_eq!(
-            temporal.maintenance_units().unwrap(),
-            predictive.maintenance_units().unwrap()
-        );
-        for x in stream {
-            temporal.step(&[vec![x]], false).unwrap();
-            predictive.step(&[vec![x]], false).unwrap();
-            assert_eq!(temporal.layers, predictive.layers);
-            assert_eq!(temporal.steps_seen, predictive.steps_seen);
-            assert_eq!(
-                temporal.maintenance_units().unwrap(),
-                predictive.maintenance_units().unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn predictive_scale_and_signed_orthogonal_invariance() {
-        fn build(
-            current: &[f64],
-            source: &[f64],
-            target: &[f64],
-            temporal_variance: f64,
-        ) -> Auxein<f64> {
-            let mut n = Auxein::<f64>::new_with_mode(
-                2,
-                10.0,
-                0.0,
-                Mode::Predictive,
-                Budget::kernels("100"),
-                "u",
-            )
-            .unwrap();
-            n.layers[0].cells = vec![Kernel::new(1.0, current, 0.0).unwrap()];
-            let mut temporal = source.to_vec();
-            temporal.extend_from_slice(target);
-            n.layers[0].temporal_cells =
-                vec![Kernel::new(1.0, &temporal, temporal_variance).unwrap()];
-            n
-        }
-
-        let mut base = build(&[1.0, 0.0], &[0.9, 0.1], &[0.0, 2.0], 77.0);
-        let base_report = base.step(&[vec![1.0, 0.0]], false).unwrap();
-        let p = &base_report.readout.predictions()[0];
-
-        let mut scaled = build(&[10.0, 0.0], &[9.0, 1.0], &[0.0, 20.0], 7700.0);
-        let scaled_report = scaled.step(&[vec![10.0, 0.0]], false).unwrap();
-        let ps = &scaled_report.readout.predictions()[0];
-        assert_eq!(ps.universe, p.universe);
-        assert_eq!(
-            ps.current_context,
-            p.current_context
-                .iter()
-                .map(|x| 10.0 * x)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            ps.recognised_source,
-            p.recognised_source
-                .iter()
-                .map(|x| 10.0 * x)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            ps.predicted_successor,
-            p.predicted_successor
-                .iter()
-                .map(|x| 10.0 * x)
-                .collect::<Vec<_>>()
-        );
-
-        // Q(x,y)=(-y,x), a signed orthogonal permutation.
-        let mut rotated = build(&[0.0, 1.0], &[-0.1, 0.9], &[-2.0, 0.0], 77.0);
-        let rotated_report = rotated.step(&[vec![0.0, 1.0]], false).unwrap();
-        let pr = &rotated_report.readout.predictions()[0];
-        let q = |v: &[f64]| vec![-v[1], v[0]];
-        assert_eq!(pr.universe, p.universe);
-        assert_eq!(pr.current_context, q(&p.current_context));
-        assert_eq!(pr.recognised_source, q(&p.recognised_source));
-        assert_eq!(pr.predicted_successor, q(&p.predicted_successor));
-    }
-
-    #[test]
-    fn predictive_roundtrip_preserves_mode_state_and_readout() {
-        let mut n = Auxein::<f64>::new_with_mode(
-            1,
-            10.0,
-            0.0,
-            Mode::Predictive,
-            Budget::kernels("100"),
-            "roundtrip",
-        )
-        .unwrap();
-        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
-        n.layers[0].temporal_cells = vec![Kernel::new(1.0, &[1.0, 5.0], 0.0).unwrap()];
-        let state = n.export_json();
-        assert!(state.contains("\"format_version\":4"));
-        assert!(state.contains("\"mode\":\"predictive\""));
-
-        let mut restored =
-            Auxein::<f64>::from_json(&state, Budget::units(n.budget_units()), "roundtrip").unwrap();
-        assert_eq!(restored.mode(), Mode::Predictive);
-        assert_eq!(restored.export_json(), state);
-        let report = restored.step(&[vec![1.0]], false).unwrap();
-        assert_eq!(report.readout.predictions().len(), 1);
-        assert_eq!(
-            report.readout.predictions()[0].predicted_successor,
-            vec![5.0]
-        );
-    }
-
-    #[test]
-    fn temporal_readout_recognises_adjacent_order() {
-        let mut n = Auxein::<f64>::new_with_mode(
-            1,
-            10.0,
-            0.0,
-            Mode::Temporal,
-            Budget::kernels("100"),
-            "lab",
-        )
-        .unwrap();
-        n.layers[0].cells = vec![
-            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[5.0], 0.0).unwrap(),
-        ];
-        n.layers[0].temporal_cells = vec![Kernel::new(1.0, &[1.0, 5.0], 0.0).unwrap()];
-
-        let first = n.step(&[vec![1.0]], false).unwrap();
-        assert!(first.readout.sequences().is_empty());
-        let second = n.step(&[vec![5.0]], false).unwrap();
-        assert_eq!(second.readout.concepts().len(), 1);
-        assert_eq!(second.readout.concepts()[0].local_input.as_ref(), &[5.0]);
-        assert_eq!(second.readout.concepts()[0].recognised, vec![5.0]);
-        assert_eq!(second.readout.sequences().len(), 1);
-        let seq = &second.readout.sequences()[0];
-        assert_eq!(seq.universe.as_ref(), "lab");
-        assert_eq!(seq.previous_input.as_ref(), &[1.0]);
-        assert_eq!(seq.current_input.as_ref(), &[5.0]);
-        assert_eq!(seq.previous_recognised, vec![1.0]);
-        assert_eq!(seq.current_recognised, vec![5.0]);
-        let third = n.step(&[vec![1.0]], false).unwrap();
-        assert!(third.readout.sequences().is_empty());
-    }
-
-    #[test]
-    fn temporal_recurrence_promotes_only_after_recurrence() {
-        let mut n = make_temporal64();
-        n.layers[0].cells = vec![
-            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[5.0], 0.0).unwrap(),
-        ];
-        n.step(&[vec![1.0]], false).unwrap();
-        n.step(&[vec![5.0]], false).unwrap();
-        assert_eq!(n.layers[0].temporal_sigma.len(), 1);
-        assert_eq!(n.layers[0].temporal_sigma[0].center(), vec![1.0, 5.0]);
-        n.step(&[vec![1.0]], false).unwrap();
-        n.step(&[vec![5.0]], false).unwrap();
-        assert!(n.layers[0]
-            .temporal_cells
-            .iter()
-            .any(|cell| cell.center() == vec![1.0, 5.0]));
-    }
-
-    #[test]
-    fn missing_context_breaks_temporal_chain() {
-        let mut n = Auxein::<f64>::new_with_mode(
-            1,
-            10.0,
-            0.0,
-            Mode::Temporal,
-            Budget::kernels("100"),
-            "auxein",
-        )
-        .unwrap();
-        n.layers[0].cells = vec![
-            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[3.0], 0.0).unwrap(),
-        ];
-        n.layers[0].temporal_cells = vec![Kernel::new(1.0, &[1.0, 3.0], 0.0).unwrap()];
-        n.step(&[vec![1.0]], false).unwrap();
-        let gap = n.step(&[vec![99.0]], false).unwrap();
-        assert!(gap.readout.concepts().is_empty());
-        assert!(!n.summary().unwrap().previous_context_per_layer[0]);
-        let after = n.step(&[vec![3.0]], false).unwrap();
-        assert!(after.readout.sequences().is_empty());
-    }
-
-    #[test]
-    fn eta_zero_freezes_temporal_learning_but_previous_advances() {
-        let mut n = Auxein::<f64>::new_with_mode(
-            1,
-            10.0,
-            0.0,
-            Mode::Temporal,
-            Budget::kernels("100"),
-            "auxein",
-        )
-        .unwrap();
-        n.layers[0].cells = vec![
-            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[3.0], 0.0).unwrap(),
-        ];
-        n.layers[0].temporal_cells = vec![Kernel::new(1.0, &[1.0, 3.0], 1.0).unwrap()];
-        let before = n.layers[0].temporal_cells.clone();
-        n.step(&[vec![1.0]], false).unwrap();
-        let report = n.step(&[vec![3.0]], false).unwrap();
-        assert!(!report.readout.sequences().is_empty());
-        assert_eq!(n.layers[0].temporal_cells, before);
-        assert_eq!(n.layers[0].previous.as_ref().unwrap().center(), vec![3.0]);
-    }
-
-    #[test]
-    fn temporal_roundtrip_preserves_previous_context() {
-        let mut n = Auxein::<f64>::new_with_mode(
-            1,
-            10.0,
-            0.0,
-            Mode::Temporal,
-            Budget::kernels("100"),
-            "roundtrip",
-        )
-        .unwrap();
-        n.layers[0].cells = vec![
-            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[3.0], 0.0).unwrap(),
-        ];
-        n.layers[0].temporal_cells = vec![Kernel::new(1.0, &[1.0, 3.0], 0.0).unwrap()];
-        n.step(&[vec![1.0]], false).unwrap();
-        let state = n.export_json();
-        let mut restored =
-            Auxein::<f64>::from_json(&state, Budget::units(n.budget_units()), "roundtrip").unwrap();
-        assert_eq!(restored.export_json(), state);
-        let report = restored.step(&[vec![3.0]], false).unwrap();
-        assert_eq!(report.readout.sequences().len(), 1);
-        let seq = &report.readout.sequences()[0];
-        assert_eq!(seq.previous_input.as_ref(), &[1.0]);
-        assert_eq!(seq.current_input.as_ref(), &[3.0]);
-        assert_eq!(seq.previous_recognised, vec![1.0]);
-        assert_eq!(seq.current_recognised, vec![3.0]);
-    }
-
-    #[test]
-    fn temporal_growth_shares_one_global_transaction() {
-        let mut n = make_temporal64();
-        n.layers[0].cells = vec![
-            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[3.0], 0.0).unwrap(),
-        ];
-        n.step(&[vec![1.0]], false).unwrap();
-        let base = n.maintenance_units().unwrap();
-        let extra = n
-            .kernel_units()
-            .unwrap()
-            .max(n.temporal_kernel_units().unwrap());
-        n.set_budget(Budget::units(base + extra)).unwrap();
-        let report = n.step(&[vec![3.0], vec![9.0]], false).unwrap();
-        let growth = report
-            .transformations
-            .iter()
-            .rev()
-            .find(|t| matches!(t, Transformation::GrowthReject { .. }))
-            .expect("growth rejection");
-        match growth {
-            Transformation::GrowthReject {
-                geometric_seeds,
-                temporal_seeds,
-                ..
-            } => {
-                assert_eq!(*geometric_seeds, 1);
-                assert_eq!(*temporal_seeds, 1);
+            p[0],
+            OutputAtom {
+                weight: 0.75,
+                center: vec![0.0],
+                variance: 0.0
             }
-            _ => unreachable!(),
-        }
-        assert!(n.layers[0].sigma.is_empty());
-        assert!(n.layers[0].temporal_sigma.is_empty());
+        );
+        assert_eq!(
+            p[1],
+            OutputAtom {
+                weight: 0.25,
+                center: vec![2.0],
+                variance: 0.0
+            }
+        );
+        assert!((stable_sum(p.iter().map(|a| a.weight)) - 1.0).abs() < 1e-15);
     }
 
     #[test]
-    fn forced_contraction_invalidates_temporal_previous() {
-        let mut n = Auxein::<f64>::new_with_mode(
-            1,
-            10.0,
-            0.0,
-            Mode::Temporal,
-            Budget::kernels("100"),
-            "auxein",
-        )
-        .unwrap();
-        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
-        n.layers[0].temporal_cells = vec![Kernel::new(1.0, &[1.0, 1.0], 0.0).unwrap()];
+    fn weighted_boundary_rejects_invalid_mass() {
+        let mut n = make64();
+        let bad = vec![
+            InputAtom::new(0.6, vec![1.0], 0.0),
+            InputAtom::new(0.6, vec![2.0], 0.0),
+        ];
+        assert!(n.step_weighted(&bad, false).is_err());
+        assert!(n.step_weighted(&[], false).is_err());
+    }
+
+    #[test]
+    fn gain_weighted_context_matches_concern_not_support() {
+        let a = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":10.0},{"W":1.0,"C":[2.0],"V":10.0}]}]}"#;
+        let b = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1e-200,"C":[1.0],"V":10.0},{"W":1e200,"C":[2.0],"V":10.0}]}]}"#;
+        let mut na = Auxein::<f64>::from_json(a, Budget::kernels("100")).unwrap();
+        let mut nb = Auxein::<f64>::from_json(b, Budget::kernels("100")).unwrap();
+        let ra = na.step(&[vec![3.0]], true).unwrap();
+        let rb = nb.step(&[vec![3.0]], true).unwrap();
+        assert_ne!(
+            ra.layer_reports[0].cell_responsibility_mass,
+            rb.layer_reports[0].cell_responsibility_mass
+        );
+        let ca = ra.layer_reports[0].context_center.as_ref().unwrap()[0];
+        let cb = rb.layer_reports[0].context_center.as_ref().unwrap()[0];
+        assert!((ca - 21.0 / 13.0).abs() < 1e-15);
+        assert_eq!(ca, cb);
+        assert_eq!(
+            ra.layer_reports[0].context_variance,
+            rb.layer_reports[0].context_variance
+        );
+        assert!((ra.layer_reports[0].context_variance.unwrap() - 520.0 / 2197.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn step_is_atomic_and_never_learns_cross_call_transition() {
+        let mut n = make_predictive64();
+        n.layers[0].cells = vec![
+            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[5.0], 0.0).unwrap(),
+        ];
         n.step(&[vec![1.0]], false).unwrap();
-        assert!(n.layers[0].previous.is_some());
-        n.set_budget(Budget::units(n.min_units().unwrap())).unwrap();
-        n.step(&[vec![1.0]], false).unwrap();
-        assert!(n.layers[0].cells.is_empty());
+        n.step(&[vec![5.0]], false).unwrap();
+        assert!(n.layers[0].temporal_sigma.is_empty());
         assert!(n.layers[0].temporal_cells.is_empty());
         assert!(n.layers[0].previous.is_none());
     }
 
     #[test]
+    fn explicit_sequence_learns_adjacent_transition_and_clears_previous() {
+        let mut n = make_predictive64();
+        n.layers[0].cells = vec![
+            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[5.0], 0.0).unwrap(),
+        ];
+        n.sequence(&[vec![vec![1.0]], vec![vec![5.0]]], false)
+            .unwrap();
+        assert_eq!(n.layers[0].temporal_sigma.len(), 1);
+        assert_eq!(
+            scalar_vec_to_f64(&n.layers[0].temporal_sigma[0].center),
+            vec![1.0, 5.0]
+        );
+        assert!(n.layers[0].previous.is_none());
+    }
+
+    #[test]
+    fn sequence_boundary_prevents_cross_sequence_transition() {
+        let mut n = make_predictive64();
+        n.layers[0].cells = vec![
+            Kernel::new(1.0, &[-10.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[-1.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[10.0], 0.0).unwrap(),
+        ];
+        n.sequence(&[vec![vec![1.0]], vec![vec![10.0]]], false)
+            .unwrap();
+        n.sequence(&[vec![vec![-1.0]], vec![vec![-10.0]]], false)
+            .unwrap();
+        let centers: Vec<Vec<f64>> = n.layers[0]
+            .temporal_sigma
+            .iter()
+            .chain(n.layers[0].temporal_cells.iter())
+            .map(|k| scalar_vec_to_f64(&k.center))
+            .collect();
+        assert!(centers.contains(&vec![1.0, 10.0]), "centers={centers:?}");
+        assert!(centers.contains(&vec![-1.0, -10.0]), "centers={centers:?}");
+        assert!(!centers.contains(&vec![10.0, -1.0]), "centers={centers:?}");
+    }
+
+    #[test]
+    fn singleton_can_predict_but_cannot_leave_previous() {
+        let mut n =
+            Auxein::<f64>::new_with_mode(1, 10.0, 0.0, Mode::Predictive, Budget::kernels("100"))
+                .unwrap();
+        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
+        n.layers[0].temporal_cells = vec![Kernel::new(1.0, &[1.0, 2.0], 0.0).unwrap()];
+        let report = n.step(&[vec![1.0]], false).unwrap();
+        assert_eq!(report.readout.future().len(), 1);
+        assert_eq!(
+            report.readout.future()[0],
+            vec![OutputAtom {
+                weight: 1.0,
+                center: vec![2.0],
+                variance: 0.0
+            }]
+        );
+        assert!(n.layers[0].previous.is_none());
+    }
+
+    #[test]
+    fn prediction_preserves_current_context_mass_and_branches_without_ranking() {
+        let mut n =
+            Auxein::<f64>::new_with_mode(1, 10.0, 0.0, Mode::Predictive, Budget::kernels("100"))
+                .unwrap();
+        n.layers[0].cells = vec![Kernel::new(1.0, &[2.0], 0.0).unwrap()];
+        n.layers[0].temporal_cells = vec![
+            Kernel::new(1.0, &[2.0, 7.0], 0.0).unwrap(),
+            Kernel::new(999.0, &[2.0, 8.0], 77.0).unwrap(),
+        ];
+        let input = vec![
+            InputAtom::new(0.25, vec![2.0], 0.0),
+            InputAtom::new(0.75, vec![99.0], 0.0),
+        ];
+        let report = n.step_weighted(&input, false).unwrap();
+        assert_eq!(report.readout.future().len(), 2);
+        for p in report.readout.future() {
+            assert_eq!(p.len(), 2);
+            assert_eq!(p[0].weight, 0.75);
+            assert_eq!(p[0].center, vec![0.0]);
+            assert_eq!(p[1].weight, 0.25);
+            assert_eq!(p[1].variance, 0.0);
+        }
+        let targets: Vec<f64> = report
+            .readout
+            .future()
+            .iter()
+            .map(|p| p[1].center[0])
+            .collect();
+        assert_eq!(targets, vec![7.0, 8.0]);
+    }
+
+    #[test]
+    fn predictive_relative_gain_weights_branches_independently() {
+        let mut n =
+            Auxein::<f64>::new_with_mode(1, 10.0, 0.0, Mode::Predictive, Budget::kernels("100"))
+                .unwrap();
+        n.layers[0].cells = vec![Kernel::new(1.0, &[2.0], 0.0).unwrap()];
+        n.layers[0].temporal_cells = vec![
+            Kernel::new(1.0, &[2.0, 7.0], 0.0).unwrap(),
+            Kernel::new(999.0, &[3.9, 8.0], 77.0).unwrap(),
+        ];
+        let input = vec![
+            InputAtom::new(0.25, vec![2.0], 0.0),
+            InputAtom::new(0.75, vec![99.0], 0.0),
+        ];
+        let report = n.step_weighted(&input, false).unwrap();
+        assert_eq!(report.readout.future().len(), 2);
+
+        let mut seen = Vec::new();
+        for presentation in report.readout.future() {
+            let directional = presentation
+                .iter()
+                .find(|atom| atom.center[0] != 0.0)
+                .unwrap();
+            seen.push((directional.center[0], directional.weight));
+        }
+        seen.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(seen[0], (7.0, 0.25));
+        assert!((seen[1].0 - 8.0).abs() < f64::EPSILON);
+        assert!((seen[1].1 - 0.024375).abs() < 1e-15);
+    }
+
+    #[test]
+    fn predictive_same_target_uses_max_relative_gain() {
+        let mut n =
+            Auxein::<f64>::new_with_mode(1, 10.0, 0.0, Mode::Predictive, Budget::kernels("100"))
+                .unwrap();
+        n.layers[0].cells = vec![Kernel::new(1.0, &[2.0], 0.0).unwrap()];
+        n.layers[0].temporal_cells = vec![
+            Kernel::new(1.0, &[3.9, 7.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[2.0, 7.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[3.9, 7.0], 0.0).unwrap(),
+        ];
+        let input = vec![
+            InputAtom::new(0.25, vec![2.0], 0.0),
+            InputAtom::new(0.75, vec![99.0], 0.0),
+        ];
+        let report = n.step_weighted(&input, false).unwrap();
+        assert_eq!(report.readout.future().len(), 1);
+        let directional = report.readout.future()[0]
+            .iter()
+            .find(|atom| atom.center[0] != 0.0)
+            .unwrap();
+        assert_eq!(directional.center, vec![7.0]);
+        assert_eq!(directional.weight, 0.25);
+    }
+
+    #[test]
+    fn predictive_relative_gain_is_scale_invariant_at_extremes() {
+        for scale in [1.0, 1e-158, 1e-200, 1e158, 1e200] {
+            let current = [2.0 * scale];
+            let source = [3.9 * scale];
+            let current2 = norm2(&current);
+            let gamma = point_relative_gain_scalar(&current, current2, true, &source).unwrap();
+            assert!(
+                (gamma - 0.0975).abs() < 1e-14,
+                "scale={scale} gamma={gamma}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_target_is_explicit_and_prediction_is_not_recursive() {
+        let mut n =
+            Auxein::<f64>::new_with_mode(1, 10.0, 0.0, Mode::Predictive, Budget::kernels("100"))
+                .unwrap();
+        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
+        n.layers[0].temporal_cells = vec![
+            Kernel::new(1.0, &[1.0, 0.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[1.0, 2.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[2.0, 3.0], 0.0).unwrap(),
+        ];
+        let report = n.step(&[vec![1.0]], false).unwrap();
+        assert_eq!(report.readout.future().len(), 2);
+        assert!(report.readout.future().contains(&vec![OutputAtom {
+            weight: 1.0,
+            center: vec![0.0],
+            variance: 0.0
+        }]));
+        assert!(report.readout.future().contains(&vec![OutputAtom {
+            weight: 1.0,
+            center: vec![2.0],
+            variance: 0.0
+        }]));
+        assert!(!report.readout.future().contains(&vec![OutputAtom {
+            weight: 1.0,
+            center: vec![3.0],
+            variance: 0.0
+        }]));
+    }
+
+    #[test]
     fn temporal_product_kernel_is_exact_direct_sum_quotient() {
-        let n = make_temporal64();
-        let previous = Kernel64 {
+        let n = make_predictive64();
+        let a = Kernel64 {
             weight: 0.5,
             center: vec![2.0],
             variance: 1.0,
         };
-        let current = Kernel64 {
+        let b = Kernel64 {
             weight: 0.25,
             center: vec![7.0],
             variance: 4.0,
         };
-        let temporal = n.temporal_atom(&previous, &current);
-        assert_eq!(temporal.r, 0.125);
-        assert_eq!(temporal.x.as_ref(), &[2.0, 7.0]);
-        assert_eq!(temporal.variance, 5.0);
+        let t = n.temporal_atom(&a, &b).unwrap();
+        assert_eq!(t.r, 0.125);
+        assert_eq!(t.x.as_ref(), &[2.0, 7.0]);
+        assert_eq!(t.variance, 5.0);
     }
 
     #[test]
-    fn temporal_population_does_not_age_without_temporal_presentation() {
-        let mut n = make_temporal64();
+    fn eta_zero_advances_previous_inside_sequence_only() {
+        let mut n =
+            Auxein::<f64>::new_with_mode(1, 10.0, 0.0, Mode::Predictive, Budget::kernels("100"))
+                .unwrap();
+        n.layers[0].cells = vec![
+            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
+            Kernel::new(1.0, &[3.0], 0.0).unwrap(),
+        ];
+        n.begin_sequence(false).unwrap();
+        n.sequence_step(&[vec![1.0]], false).unwrap();
+        assert_eq!(
+            scalar_vec_to_f64(&n.layers[0].previous.as_ref().unwrap().center),
+            vec![1.0]
+        );
+        n.sequence_step(&[vec![3.0]], false).unwrap();
+        assert_eq!(
+            scalar_vec_to_f64(&n.layers[0].previous.as_ref().unwrap().center),
+            vec![3.0]
+        );
+        assert!(n.layers[0].temporal_sigma.is_empty());
+        n.end_sequence().unwrap();
+        assert!(n.layers[0].previous.is_none());
+    }
+
+    #[test]
+    fn direct_composition_is_depth_ordered_atomic_geometry() {
+        let up_state = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":0,"layers":[{"sigma":[],"cells":[{"W":1.0,"C":[1.0],"V":0.0},{"W":1.0,"C":[3.0],"V":0.0}]},{"sigma":[],"cells":[{"W":1.0,"C":[2.0],"V":1.0}]}]}"#;
+        let mut up = Auxein::<f64>::from_json(up_state, Budget::kernels("1000")).unwrap();
+        let family = up
+            .step(&[vec![1.0], vec![3.0]], false)
+            .unwrap()
+            .readout
+            .present()
+            .to_vec();
+        assert_eq!(family.len(), 2);
+        let mut down = make_predictive64();
+        down.layers[0].cells = vec![
+            Kernel::new(1.0, &[1.0], 10.0).unwrap(),
+            Kernel::new(1.0, &[2.0], 10.0).unwrap(),
+            Kernel::new(1.0, &[3.0], 10.0).unwrap(),
+        ];
+        let reports = down.consume(&family, false).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(down.layers[0].temporal_sigma.is_empty());
+        assert!(down.layers[0].temporal_cells.is_empty());
+        assert!(down.layers[0].previous.is_none());
+    }
+
+    #[test]
+    fn predictive_roundtrip_preserves_private_state_and_atomic_default() {
+        let mut n =
+            Auxein::<f64>::new_with_mode(1, 10.0, 0.0, Mode::Predictive, Budget::kernels("100"))
+                .unwrap();
         n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
-        n.layers[0].temporal_cells = vec![Kernel::new(2.0, &[1.0, 1.0], 0.5).unwrap()];
-        let before = n.layers[0].temporal_cells[0].clone();
-        n.step(&[vec![99.0]], false).unwrap();
-        assert_eq!(n.layers[0].temporal_cells[0], before);
+        n.layers[0].temporal_cells = vec![Kernel::new(1.0, &[1.0, 2.0], 0.0).unwrap()];
+        let state = n.export_json();
+        assert!(state.contains("\"format_version\":5"));
+        let mut restored =
+            Auxein::<f64>::from_json(&state, Budget::units(n.budget_units())).unwrap();
+        assert_eq!(restored.export_json(), state);
+        let report = restored.step(&[vec![1.0]], false).unwrap();
+        assert_eq!(report.readout.future()[0][0].center, vec![2.0]);
+        assert!(restored.layers[0].previous.is_none());
     }
 
     #[test]
-    fn temporal_mode_preserves_geometric_trajectory_with_sufficient_budget() {
-        let mut g = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("10000"), "auxein").unwrap();
-        let mut t = Auxein::<f64>::new_with_mode(
-            1,
-            10.0,
-            1.0,
-            Mode::Temporal,
-            Budget::kernels("10000"),
-            "auxein",
-        )
-        .unwrap();
-        let sequence = [
+    fn predictive_and_geometry_share_geometric_trajectory() {
+        let mut g = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("10000")).unwrap();
+        let mut p =
+            Auxein::<f64>::new_with_mode(1, 10.0, 1.0, Mode::Predictive, Budget::kernels("10000"))
+                .unwrap();
+        let sequence = vec![
             vec![vec![1.0]],
             vec![vec![5.0]],
             vec![vec![1.0]],
             vec![vec![5.0]],
             vec![vec![1.0], vec![5.0]],
         ];
-        for _ in 0..5 {
+        for _ in 0..4 {
             for presentation in &sequence {
                 g.step(presentation, false).unwrap();
-                t.step(presentation, false).unwrap();
             }
+            p.sequence(&sequence, false).unwrap();
         }
-        assert_eq!(g.layers.len(), t.layers.len());
-        for (gl, tl) in g.layers.iter().zip(&t.layers) {
-            assert_eq!(gl.cells, tl.cells);
-            assert_eq!(gl.sigma, tl.sigma);
+        assert_eq!(g.layers.len(), p.layers.len());
+        for (gl, pl) in g.layers.iter().zip(&p.layers) {
+            assert_eq!(gl.cells, pl.cells);
+            assert_eq!(gl.sigma, pl.sigma);
         }
     }
 
     #[test]
-    fn temporal_scale_invariance() {
-        let mut a = Auxein::<f64>::new_with_mode(
-            1,
-            10.0,
-            1.0,
-            Mode::Temporal,
-            Budget::kernels("10000"),
-            "auxein",
+    fn temporal_population_does_not_age_without_temporal_presentation() {
+        let mut n =
+            Auxein::<f64>::new_with_mode(1, 10.0, 1.0, Mode::Predictive, Budget::kernels("100"))
+                .unwrap();
+        n.layers[0].cells = vec![Kernel::new(1.0, &[1.0], 0.0).unwrap()];
+        n.layers[0].temporal_cells = vec![Kernel::new(2.0, &[1.0, 1.0], 0.5).unwrap()];
+        let before = n.layers[0].temporal_cells[0].clone();
+        n.sequence(&[vec![vec![99.0]], vec![vec![99.0]]], false)
+            .unwrap();
+        assert_eq!(n.layers[0].temporal_cells[0], before);
+    }
+
+    #[test]
+    fn steps_seen_saturates_without_stopping_cognition() {
+        let state = r#"{"format_version":5,"dimension":1,"scalar":"f64","memory":10.0,"eta":0.0,"mode":"geometry","steps_seen":18446744073709551615,"layers":[{"sigma":[],"cells":[]}]}"#;
+        let mut n = Auxein::<f64>::from_json(state, Budget::kernels("10")).unwrap();
+        let report = n.step(&[vec![1.0]], false).unwrap();
+        assert_eq!(report.step_index, u64::MAX);
+        assert_eq!(n.steps_seen(), u64::MAX);
+        let report2 = n.step(&[vec![2.0]], false).unwrap();
+        assert_eq!(report2.step_index, u64::MAX);
+        assert_eq!(n.steps_seen(), u64::MAX);
+    }
+
+    #[test]
+    fn decay_clock_rollover_is_transparent() {
+        let mut n = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("100")).unwrap();
+        let clock = n.layers[0].cell_decay.clone();
+        let mut cell = Kernel::new(1.0, &[1.0], 0.0).unwrap();
+        cell.bind_decay_clock(clock.clone(), 0);
+        n.layers[0].cells = vec![cell];
+        clock.epoch.store(u64::MAX, AtomicOrdering::Relaxed);
+        let report = n.step(&[vec![1.0]], false).unwrap();
+        assert_eq!(report.readout.present().len(), 1);
+        assert_eq!(clock.epoch(), 1);
+        assert!(n.layers[0].cells[0].weight().is_finite());
+        assert!(n.layers[0].cells[0].weight() > 0.0);
+    }
+
+    #[test]
+    fn zero_lambda_is_a_normal_long_running_case() {
+        let mut n = Auxein::<f64>::new(1, f64::MIN_POSITIVE, 1.0, Budget::kernels("100")).unwrap();
+        assert_eq!(n.lambda(), 0.0);
+        let clock = n.layers[0].cell_decay.clone();
+        let mut cell = Kernel::new(1.0, &[1.0], 0.0).unwrap();
+        cell.bind_decay_clock(clock, 0);
+        n.layers[0].cells = vec![cell];
+        n.step(&[vec![100.0]], false).unwrap();
+        assert_eq!(n.layers[0].cells[0].weight(), f64::from_bits(1));
+    }
+
+    #[test]
+    fn unrepresentable_f32_learning_input_is_rejected_before_mutation() {
+        let mut n = Auxein::<f32>::new(1, 10.0, 1.0, Budget::kernels("100")).unwrap();
+        let before = n.export_json();
+        assert!(n.step(&[vec![f64::MAX]], false).is_err());
+        assert_eq!(n.export_json(), before);
+
+        let input = [InputAtom {
+            weight: 1.0,
+            center: vec![1.0],
+            variance: f64::MAX,
+        }];
+        assert!(n.step_weighted(&input, false).is_err());
+        assert_eq!(n.export_json(), before);
+    }
+
+    #[test]
+    fn streaming_state_matches_string_serializer() {
+        let mut n = make_predictive64();
+        n.sequence(
+            &[
+                vec![vec![1.0]],
+                vec![vec![2.0]],
+                vec![vec![1.0]],
+                vec![vec![2.0]],
+            ],
+            false,
         )
         .unwrap();
-        let mut b = a.clone();
-        a.layers[0].cells = vec![
-            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[5.0], 0.0).unwrap(),
-        ];
-        b.layers[0].cells = vec![
-            Kernel::new(1.0, &[10.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[50.0], 0.0).unwrap(),
-        ];
-        let sequence = [
-            vec![vec![1.0]],
-            vec![vec![5.0]],
-            vec![vec![1.0]],
-            vec![vec![5.0]],
-        ];
-        for _ in 0..5 {
-            for presentation in &sequence {
-                a.step(presentation, false).unwrap();
-                let scaled = presentation
-                    .iter()
-                    .map(|v| vec![10.0 * v[0]])
-                    .collect::<Vec<_>>();
-                b.step(&scaled, false).unwrap();
+        let expected = n.export_json();
+        let mut bytes = Vec::new();
+        n.write_json(&mut bytes).unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), expected);
+    }
+
+    #[test]
+    fn streaming_report_matches_string_serializer() {
+        let mut n = make64();
+        let report = n.step(&[vec![1.0], vec![2.0]], true).unwrap();
+        let expected = step_report_json(&report);
+        let mut bytes = Vec::new();
+        write_step_report_json(&mut bytes, &report).unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), expected);
+    }
+
+    struct FailWriter {
+        remaining: usize,
+    }
+
+    impl std::io::Write for FailWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "injected"));
             }
+            let written = buf.len().min(self.remaining);
+            self.remaining -= written;
+            Ok(written)
         }
-        assert_eq!(
-            a.layers[0].temporal_cells.len(),
-            b.layers[0].temporal_cells.len()
-        );
-        for (ka, kb) in a.layers[0]
-            .temporal_cells
-            .iter()
-            .zip(&b.layers[0].temporal_cells)
-        {
-            assert_eq!(
-                ka.center()
-                    .into_iter()
-                    .map(|x| 10.0 * x)
-                    .collect::<Vec<_>>(),
-                kb.center()
-            );
-            assert!((100.0 * ka.variance() - kb.variance()).abs() < 1e-12);
-            assert!((ka.weight() - kb.weight()).abs() < 1e-12);
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
     #[test]
-    fn zero_to_zero_is_temporally_silent() {
-        let mut n = make_temporal64();
-        n.layers[0].cells = vec![
-            Kernel::new(1.0, &[-1.0], 0.0).unwrap(),
-            Kernel::new(1.0, &[1.0], 0.0).unwrap(),
-        ];
-        n.step(&[vec![-1.0], vec![1.0]], false).unwrap();
-        n.step(&[vec![-1.0], vec![1.0]], false).unwrap();
-        assert!(n.layers[0].temporal_sigma.is_empty());
-        assert!(n.layers[0].temporal_cells.is_empty());
+    fn streaming_io_failure_does_not_mutate_state() {
+        let mut n = make64();
+        n.step(&[vec![1.0]], false).unwrap();
+        let before = n.export_json();
+        let mut writer = FailWriter { remaining: 17 };
+        assert!(matches!(n.write_json(&mut writer), Err(Error::Io(_))));
+        assert_eq!(n.export_json(), before);
+    }
+
+    #[test]
+    fn report_io_failure_is_structured() {
+        let mut n = make64();
+        let report = n.step(&[vec![1.0]], true).unwrap();
+        let mut writer = FailWriter { remaining: 11 };
+        assert!(matches!(
+            write_step_report_json(&mut writer, &report),
+            Err(Error::Io(_))
+        ));
+    }
+
+    #[test]
+    fn transient_scratch_can_be_compacted_without_cognitive_change() {
+        let mut n = Auxein::<f64>::new(1, 10.0, 1.0, Budget::kernels("10000")).unwrap();
+        let clock = n.layers[0].cell_decay.clone();
+        n.layers[0].cells = (1..=512)
+            .map(|i| {
+                let mut kernel = Kernel::new(1.0, &[i as f64], 1_000_000.0).unwrap();
+                kernel.bind_decay_clock(clock.clone(), 0);
+                kernel
+            })
+            .collect();
+        n.step(&[vec![1000.0]], false).unwrap();
+        assert!(n.transient_memory_capacity_bytes() > 0);
+        let before = n.export_json();
+        n.compact_transient_memory();
+        assert_eq!(n.transient_memory_capacity_bytes(), 0);
+        assert_eq!(n.export_json(), before);
+    }
+
+    #[test]
+    fn hostile_json_nesting_is_bounded() {
+        let depth = 24usize; // parser bound is intentionally below this adversarial depth
+        let text = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(json::parse(&text).is_err());
+        assert!(parse_presentation_json(&text).is_err());
+        assert!(parse_weighted_presentation_json(&text).is_err());
+    }
+
+    #[test]
+    fn malformed_ascii_json_never_panics() {
+        let alphabet = b"[]{}:,\\\"-+.eE0123456789truefalsenull abcXYZ";
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for len in 0..256usize {
+            for _ in 0..16 {
+                let mut text = String::with_capacity(len);
+                for _ in 0..len {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    text.push(alphabet[(state as usize) % alphabet.len()] as char);
+                }
+                let result = std::panic::catch_unwind(|| {
+                    let _ = json::parse(&text);
+                    let _ = parse_presentation_json(&text);
+                    let _ = parse_weighted_presentation_json(&text);
+                    let _ = Auxein::<f64>::from_json(&text, Budget::kernels("10"));
+                });
+                assert!(result.is_ok(), "parser panicked on {text:?}");
+            }
+        }
     }
 }
